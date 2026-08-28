@@ -134,6 +134,29 @@ func TestDecodeConfigEnableResetProbe(t *testing.T) {
 	}
 }
 
+func TestDecodeConfigProbeTriggerSchedule(t *testing.T) {
+	cfg, err := DecodeConfig([]byte(`
+probe_send_timezone: Asia/Shanghai
+probe_trigger_times: ["17:00", "07:00", "12:00", "12:00"]
+`))
+	if err != nil {
+		t.Fatalf("DecodeConfig returned error: %v", err)
+	}
+	want := []int{7 * 60, 12 * 60, 17 * 60}
+	if !reflect.DeepEqual(cfg.ProbeTriggerMinutes, want) {
+		t.Fatalf("ProbeTriggerMinutes = %#v, want %#v", cfg.ProbeTriggerMinutes, want)
+	}
+	if cfg.ProbeSendTimezone != "Asia/Shanghai" {
+		t.Fatalf("ProbeSendTimezone = %q", cfg.ProbeSendTimezone)
+	}
+}
+
+func TestDecodeConfigRejectsInvalidProbeTriggerTime(t *testing.T) {
+	if _, err := DecodeConfig([]byte("probe_trigger_times: [\"25:00\"]\n")); err == nil {
+		t.Fatal("DecodeConfig accepted invalid probe trigger time")
+	}
+}
+
 func TestDecodeConfigAdaptiveRefreshOverrides(t *testing.T) {
 	cfg, err := DecodeConfig([]byte(`
 refresh_active_window: 2h

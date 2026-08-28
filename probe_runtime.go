@@ -196,6 +196,74 @@ func (r *QuotaRefresher) probeObservationInterval() time.Duration {
 	return interval
 }
 
+func (r *QuotaRefresher) probeScheduleConfig() ([]int, *time.Location, string) {
+	if r == nil || r.state == nil {
+		return nil, time.Local, ""
+	}
+	cfg := r.state.Config()
+	minutes := append([]int(nil), cfg.ProbeTriggerMinutes...)
+	loc := probeSendLocation(cfg.ProbeSendTimezone)
+	key := cfg.ProbeSendTimezone + "|" + formatProbeTriggerTimes(minutes)
+	return minutes, loc, key
+}
+
+func (r *QuotaRefresher) nextProbeScheduleDeadline(now time.Time) time.Time {
+	minutes, loc, key := r.probeScheduleConfig()
+	if len(minutes) == 0 {
+		return time.Time{}
+	}
+	r.probeScheduleMu.Lock()
+	defer r.probeScheduleMu.Unlock()
+	if r.probeScheduleKey != key || r.probeNextTrigger.IsZero() {
+		r.probeScheduleKey = key
+		r.probeNextTrigger = nextProbeTriggerAt(minutes, loc, now)
+	}
+	return r.probeNextTrigger
+}
+
+func (r *QuotaRefresher) consumeProbeSchedule(now time.Time) bool {
+	minutes, loc, key := r.probeScheduleConfig()
+	if len(minutes) == 0 {
+		return false
+	}
+	r.probeScheduleMu.Lock()
+	defer r.probeScheduleMu.Unlock()
+	if r.probeScheduleKey != key || r.probeNextTrigger.IsZero() {
+		r.probeScheduleKey = key
+		r.probeNextTrigger = nextProbeTriggerAt(minutes, loc, now)
+		return false
+	}
+	if now.Before(r.probeNextTrigger) {
+		return false
+	}
+	r.probeNextTrigger = nextProbeTriggerAt(minutes, loc, r.probeNextTrigger.Add(time.Nanosecond))
+	return true
+}
+
+func (r *QuotaRefresher) armScheduledFiveHourChecks() error {
+	if r == nil || r.probeController == nil || r.runtimeStore == nil {
+		return nil
+	}
+	r.probeHoldMu.Lock()
+	defer r.probeHoldMu.Unlock()
+	touched := map[AuthInstanceID]struct{}{}
+	for instance, windows := range r.probeController.Snapshot() {
+		window, ok := windows[ProbeWindowFiveHour]
+		if !ok {
+			continue
+		}
+		switch window.State {
+		case ProbeWaitingReset, ProbeRetryWait, ProbeConfirmed:
+			window.State = ProbePendingCheck
+			window.Deadline = time.Time{}
+			window.AttemptID = ""
+			r.probeController.SetWindow(instance, ProbeWindowFiveHour, window)
+			touched[instance] = struct{}{}
+		}
+	}
+	return r.persistProbeInstances(touched)
+}
+
 func (r *QuotaRefresher) persistProbeInstances(instances map[AuthInstanceID]struct{}) error {
 	if r.runtimeStore == nil || r.probeController == nil || len(instances) == 0 {
 		return nil
@@ -1114,12 +1182,27 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		// lands inside an allowed window. Deferring here (rather than skipping
 		// the whole probe) reuses the existing WAL-safe "nothing to send" path.
 		probeCfg := r.state.Config()
-		sendAllowed := probeSendAllowedAt(probeCfg.ProbeSendWindows, probeSendLocation(probeCfg.ProbeSendTimezone), r.now())
+		now := r.now()
+		location := probeSendLocation(probeCfg.ProbeSendTimezone)
+		sendAllowed := probeSendAllowedAt(probeCfg.ProbeSendWindows, location, now) && probeTriggerAllowedAt(probeCfg.ProbeTriggerMinutes, location, now)
 		if !sendAllowed && len(lazy) > 0 {
 			deferFields := fields(lazy)
 			deferFields["send_windows"] = formatProbeSendWindows(probeCfg.ProbeSendWindows)
 			deferFields["timezone"] = probeCfg.ProbeSendTimezone
+			deferFields["trigger_times"] = formatProbeTriggerTimes(probeCfg.ProbeTriggerMinutes)
 			recordLog("info", "probe.send_deferred", "不在允许的激活时段，本次不发激活请求", deferFields)
+			deferUntil := now.Add(r.probeObservationInterval())
+			if next := nextProbeTriggerAt(probeCfg.ProbeTriggerMinutes, location, now); !next.IsZero() {
+				deferUntil = next
+			}
+			for _, k := range lazy {
+				if w, ok := r.probeController.Window(intent.Instance, k); ok {
+					w.State = ProbeRetryWait
+					w.AttemptID = ""
+					w.Deadline = deferUntil
+					r.probeController.SetWindow(intent.Instance, k, w)
+				}
+			}
 		}
 		if len(lazy) == 0 || !sendAllowed {
 			err = r.persistTerminalProbeCompletionLocked(intent.Instance, attempt.AttemptID, pre.Quota, ProbeAttemptPrepared)

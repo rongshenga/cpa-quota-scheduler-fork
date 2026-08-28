@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,8 @@ type probeSendWindow struct {
 }
 
 const minutesPerDay = 24 * 60
+
+const probeTriggerGrace = 10 * time.Minute
 
 // Contains reports whether the given minute-of-day falls inside the window.
 // The start bound is inclusive and the end bound exclusive, so adjacent
@@ -89,6 +92,114 @@ func parseProbeSendWindows(items []string) ([]probeSendWindow, error) {
 		windows = append(windows, window)
 	}
 	return windows, nil
+}
+
+// parseProbeTriggerTimes accepts a list of HH:MM wall-clock times. Empty
+// items are ignored so values assembled from a comma-separated management
+// setting remain forgiving, while malformed non-empty items are rejected.
+func parseProbeTriggerTimes(items []string) ([]int, error) {
+	minutes := make([]int, 0, len(items))
+	seen := make(map[int]struct{}, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item) == "" {
+			continue
+		}
+		minute, err := parseClockMinute(item)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[minute]; ok {
+			continue
+		}
+		seen[minute] = struct{}{}
+		minutes = append(minutes, minute)
+	}
+	sort.Ints(minutes)
+	return minutes, nil
+}
+
+func normalizeProbeTriggerMinutes(values []int) []int {
+	if len(values) == 0 {
+		return nil
+	}
+	minutes := make([]int, 0, len(values))
+	seen := make(map[int]struct{}, len(values))
+	for _, minute := range values {
+		if minute < 0 || minute >= minutesPerDay {
+			continue
+		}
+		if _, ok := seen[minute]; ok {
+			continue
+		}
+		seen[minute] = struct{}{}
+		minutes = append(minutes, minute)
+	}
+	sort.Ints(minutes)
+	return minutes
+}
+
+func formatProbeTriggerTimes(minutes []int) string {
+	if len(minutes) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(minutes))
+	for _, minute := range minutes {
+		if minute < 0 || minute >= minutesPerDay {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%02d:%02d", minute/60, minute%60))
+	}
+	return strings.Join(parts, ",")
+}
+
+// nextProbeTriggerAt returns the next configured wall-clock trigger strictly
+// after now. The strict comparison prevents the refresh loop from repeatedly
+// firing the same trigger when it wakes exactly at the scheduled instant.
+func nextProbeTriggerAt(minutes []int, loc *time.Location, now time.Time) time.Time {
+	minutes = normalizeProbeTriggerMinutes(minutes)
+	if len(minutes) == 0 {
+		return time.Time{}
+	}
+	if loc == nil {
+		loc = time.Local
+	}
+	local := now.In(loc)
+	day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
+	for _, minute := range minutes {
+		if minute < 0 || minute >= minutesPerDay {
+			continue
+		}
+		candidate := day.Add(time.Duration(minute) * time.Minute)
+		if candidate.After(now) {
+			return candidate
+		}
+	}
+	if len(minutes) == 0 {
+		return time.Time{}
+	}
+	first := minutes[0]
+	return day.Add(24*time.Hour + time.Duration(first)*time.Minute)
+}
+
+func probeTriggerAllowedAt(minutes []int, loc *time.Location, now time.Time) bool {
+	if len(minutes) == 0 {
+		return true
+	}
+	if loc == nil {
+		loc = time.Local
+	}
+	local := now.In(loc)
+	day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
+	for _, minute := range minutes {
+		if minute < 0 || minute >= minutesPerDay {
+			continue
+		}
+		start := day.Add(time.Duration(minute) * time.Minute)
+		if !now.Before(start) && now.Before(start.Add(probeTriggerGrace)) {
+			return true
+		}
+	}
+	return false
 }
 
 // probeSendLocation resolves the configured timezone, falling back to the

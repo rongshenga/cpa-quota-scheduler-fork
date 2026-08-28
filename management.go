@@ -98,6 +98,9 @@ type SettingsPayload struct {
 	CircuitHalfOpenSuccessThreshold int         `json:"circuit_half_open_success_threshold"`
 	MaxLogEntries                   int         `json:"max_log_entries"`
 	LogRetention                    string      `json:"log_retention"`
+	ProbeSendWindows                string      `json:"probe_send_windows"`
+	ProbeSendTimezone               string      `json:"probe_send_timezone"`
+	ProbeTriggerTimes               string      `json:"probe_trigger_times"`
 }
 
 type StatusAccount struct {
@@ -317,6 +320,9 @@ func SettingsFromConfig(cfg Config) SettingsPayload {
 		CircuitHalfOpenSuccessThreshold: cfg.CircuitHalfOpenSuccessThreshold,
 		MaxLogEntries:                   cfg.MaxLogEntries,
 		LogRetention:                    cfg.LogRetention.String(),
+		ProbeSendWindows:                formatProbeSendWindows(cfg.ProbeSendWindows),
+		ProbeSendTimezone:               cfg.ProbeSendTimezone,
+		ProbeTriggerTimes:               formatProbeTriggerTimes(cfg.ProbeTriggerMinutes),
 	}
 }
 
@@ -402,6 +408,27 @@ func ConfigFromSettings(base Config, payload SettingsPayload) (Config, error) {
 		}
 		cfg.LogRetention = d
 	}
+	if strings.TrimSpace(payload.ProbeSendTimezone) != "" {
+		name := strings.TrimSpace(payload.ProbeSendTimezone)
+		if _, err := time.LoadLocation(name); err != nil {
+			return Config{}, jsonError("probe_send_timezone must be a valid IANA timezone")
+		}
+		cfg.ProbeSendTimezone = name
+	}
+	if strings.TrimSpace(payload.ProbeSendWindows) != "" {
+		windows, err := parseProbeSendWindows(strings.Split(payload.ProbeSendWindows, ","))
+		if err != nil {
+			return Config{}, jsonError("probe_send_windows must contain HH:MM-HH:MM ranges")
+		}
+		cfg.ProbeSendWindows = windows
+	}
+	if strings.TrimSpace(payload.ProbeTriggerTimes) != "" {
+		minutes, err := parseProbeTriggerTimes(strings.Split(payload.ProbeTriggerTimes, ","))
+		if err != nil {
+			return Config{}, jsonError("probe_trigger_times must contain HH:MM values")
+		}
+		cfg.ProbeTriggerMinutes = minutes
+	}
 	return NormalizeConfig(cfg), nil
 }
 
@@ -444,6 +471,7 @@ func saveSettingsPayload(store *PluginState, payload SettingsPayload) pluginapi.
 	}
 	store.ReplaceConfig(cfg)
 	currentConfig.Store(cfg)
+	wakeConfiguredRefresher()
 	if cfg.ProbeOnProvisionalRoster != previousRisk {
 		managementProvisionalRiskChanged(cfg.ProbeOnProvisionalRoster)
 	}
@@ -500,6 +528,7 @@ func handleImportState(store *PluginState, body []byte, now time.Time) pluginapi
 	}
 	store.ReplaceConfig(state.Config)
 	currentConfig.Store(state.Config)
+	wakeConfiguredRefresher()
 	store.SetAnnotations(AnnotationState{Accounts: state.Accounts, Groups: state.Groups})
 	store.RecordLog("info", "ui.config_imported", "页面导入插件配置", nil, now)
 	return jsonManagementResponse(http.StatusOK, map[string]bool{"ok": true})

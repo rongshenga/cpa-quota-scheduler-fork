@@ -89,3 +89,63 @@ func TestBadTimezoneFallsBackToLocal(t *testing.T) {
 		t.Fatal("unknown zone must degrade to time.Local, not nil")
 	}
 }
+
+func TestProbeTriggerTimesAreSortedAndDeduplicated(t *testing.T) {
+	got, err := parseProbeTriggerTimes([]string{"17:00", "07:00", "17:00", "12:00"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int{7 * 60, 12 * 60, 17 * 60}
+	if len(got) != len(want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestNormalizeProbeTriggerMinutesDropsInvalidValues(t *testing.T) {
+	got := normalizeProbeTriggerMinutes([]int{17 * 60, -1, 7 * 60, 24 * 60, 7 * 60})
+	want := []int{7 * 60, 17 * 60}
+	if len(got) != len(want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestNextProbeTriggerAtUsesConfiguredZone(t *testing.T) {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	triggers := []int{7 * 60, 12 * 60, 17 * 60}
+	before := time.Date(2026, 8, 28, 6, 59, 0, 0, loc)
+	if got, want := nextProbeTriggerAt(triggers, loc, before), time.Date(2026, 8, 28, 7, 0, 0, 0, loc); !got.Equal(want) {
+		t.Fatalf("next before first = %s, want %s", got, want)
+	}
+	after := time.Date(2026, 8, 28, 17, 1, 0, 0, loc)
+	wantNext := time.Date(2026, 8, 29, 7, 0, 0, 0, loc)
+	if got := nextProbeTriggerAt(triggers, loc, after); !got.Equal(wantNext) {
+		t.Fatalf("next after last = %s, want %s", got, wantNext)
+	}
+}
+
+func TestProbeTriggerAllowedGrace(t *testing.T) {
+	loc := time.FixedZone("CST", 8*60*60)
+	triggers := []int{7 * 60}
+	if !probeTriggerAllowedAt(triggers, loc, time.Date(2026, 8, 28, 7, 0, 0, 0, loc)) {
+		t.Fatal("trigger start must be allowed")
+	}
+	if !probeTriggerAllowedAt(triggers, loc, time.Date(2026, 8, 28, 7, 9, 59, 0, 0, loc)) {
+		t.Fatal("trigger grace must be allowed")
+	}
+	if probeTriggerAllowedAt(triggers, loc, time.Date(2026, 8, 28, 7, 10, 0, 0, loc)) {
+		t.Fatal("trigger after grace must be rejected")
+	}
+}

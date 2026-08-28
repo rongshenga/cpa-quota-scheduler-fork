@@ -245,6 +245,9 @@ type QuotaRefresher struct {
 	probeRetryGeneration   uint64
 	probeRecoveryPending   bool
 	probeOwnerRetryPending bool
+	probeScheduleMu        sync.Mutex
+	probeScheduleKey       string
+	probeNextTrigger       time.Time
 	probeHoldMu            sync.Mutex
 	probePersistPending    map[AuthInstanceID]struct{}
 	probeHoldPending       bool
@@ -1237,9 +1240,15 @@ func (r *QuotaRefresher) Start() {
 			}
 			select {
 			case <-timerC:
-				r.refreshController.OnDeadline(r.now())
+				now := r.now()
+				r.refreshController.OnDeadline(now)
 				r.RefreshDueSoon()
 				if r.probeController != nil {
+					if r.consumeProbeSchedule(now) {
+						if err := r.armScheduledFiveHourChecks(); err != nil && r.state != nil {
+							r.state.RecordLog("warn", "probe.schedule_arm_failed", "定时额度探测排程持久化失败", map[string]any{"error": err.Error()}, now)
+						}
+					}
 					r.launchProbeFromTimer(false)
 				}
 			case <-wake:
@@ -1443,6 +1452,9 @@ func (r *QuotaRefresher) nextRefreshLoopDelay() (time.Duration, bool) {
 		}
 		if !probe.IsZero() && (deadline.IsZero() || probe.Before(deadline)) {
 			deadline = probe
+		}
+		if schedule := r.nextProbeScheduleDeadline(now); !schedule.IsZero() && (deadline.IsZero() || schedule.Before(deadline)) {
+			deadline = schedule
 		}
 	}
 	if legacy := r.state.NextRefreshDueAt(now); !legacy.IsZero() && (deadline.IsZero() || legacy.Before(deadline)) {

@@ -72,7 +72,7 @@ func SavePluginDiskState(path string, state PluginDiskState) error {
 
 func normalizePluginDiskState(state PluginDiskState) PluginDiskState {
 	cfg := state.Config
-	if cfg.QuotaRefreshInterval <= 0 && cfg.StaleAfter <= 0 && cfg.MonthlyMode == "" {
+	if cfg.QuotaRefreshInterval <= 0 && cfg.StaleAfter <= 0 && cfg.MonthlyMode == "" && len(cfg.ProbeSendWindows) == 0 && len(cfg.ProbeTriggerMinutes) == 0 {
 		cfg = DefaultConfig()
 	}
 	cfg = NormalizeConfig(cfg)

@@ -238,6 +238,9 @@ fallback: fill-first
 enable_usage_feedback: true
 enable_reset_probe: false
 probe_on_provisional_roster: false
+# When enable_reset_probe is true, trigger five-hour checks in Beijing time; normal Codex requests remain unrestricted.
+probe_send_timezone: Asia/Shanghai
+probe_trigger_times: ["07:00", "12:00", "17:00"]
 max_refresh_concurrency: 1
 quota_endpoint: https://chatgpt.com/backend-api/wham/usage
 circuit_failure_threshold: 5

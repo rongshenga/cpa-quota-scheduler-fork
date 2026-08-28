@@ -54,6 +54,10 @@ type Config struct {
 	// gated by this: it costs no quota and keeps classification accurate.
 	ProbeSendWindows  []probeSendWindow
 	ProbeSendTimezone string
+	// ProbeTriggerMinutes schedules read-only/activation checks for the
+	// five-hour window. Values are minutes after midnight in the configured
+	// timezone. An empty list preserves the existing reset-deadline behavior.
+	ProbeTriggerMinutes []int
 }
 
 type registration struct {
@@ -90,6 +94,7 @@ type rawConfig struct {
 	LogRetention                    string   `yaml:"log_retention"`
 	ProbeSendWindows                []string `yaml:"probe_send_windows"`
 	ProbeSendTimezone               *string  `yaml:"probe_send_timezone"`
+	ProbeTriggerTimes               []string `yaml:"probe_trigger_times"`
 }
 
 func DefaultConfig() Config {
@@ -157,6 +162,7 @@ func NormalizeConfig(cfg Config) Config {
 	if cfg.LogRetention <= 0 {
 		cfg.LogRetention = defaults.LogRetention
 	}
+	cfg.ProbeTriggerMinutes = normalizeProbeTriggerMinutes(cfg.ProbeTriggerMinutes)
 	return cfg
 }
 
@@ -310,6 +316,13 @@ func DecodeConfig(raw []byte) (Config, error) {
 			return Config{}, fmt.Errorf("probe_send_windows: %w", err)
 		}
 		cfg.ProbeSendWindows = windows
+	}
+	if decoded.ProbeTriggerTimes != nil {
+		minutes, err := parseProbeTriggerTimes(decoded.ProbeTriggerTimes)
+		if err != nil {
+			return Config{}, fmt.Errorf("probe_trigger_times: %w", err)
+		}
+		cfg.ProbeTriggerMinutes = minutes
 	}
 	return NormalizeConfig(cfg), nil
 }

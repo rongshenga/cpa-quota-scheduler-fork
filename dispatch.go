@@ -73,7 +73,20 @@ func configure(raw []byte) error {
 	}
 	disk, loadedDisk, err := loadUserDataWithMigration(semanticStatePaths(defaultStatePath()), OSFileHooks(), nil)
 	if err == nil && loadedDisk {
-		cfg = disk.Config
+		// Persisted management settings remain authoritative for existing
+		// options, but newly introduced schedule values from the host config
+		// must not be silently discarded on an existing installation.
+		persisted := disk.Config
+		if len(cfg.ProbeTriggerMinutes) > 0 {
+			persisted.ProbeTriggerMinutes = append([]int(nil), cfg.ProbeTriggerMinutes...)
+		}
+		if cfg.ProbeSendTimezone != "" {
+			persisted.ProbeSendTimezone = cfg.ProbeSendTimezone
+		}
+		if len(cfg.ProbeSendWindows) > 0 {
+			persisted.ProbeSendWindows = append([]probeSendWindow(nil), cfg.ProbeSendWindows...)
+		}
+		cfg = NormalizeConfig(persisted)
 	} else {
 		disk = PluginDiskState{Config: cfg}
 	}
@@ -83,6 +96,15 @@ func configure(raw []byte) error {
 	startEvidenceConsumer()
 	publishSchedulerState(globalState, nil, time.Now())
 	return nil
+}
+
+func wakeConfiguredRefresher() {
+	refresherMu.Lock()
+	r := globalRefresher
+	refresherMu.Unlock()
+	if r != nil {
+		r.wakeRefreshLoop()
+	}
 }
 
 func startEvidenceConsumer() {

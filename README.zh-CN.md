@@ -207,6 +207,9 @@ fallback: fill-first
 enable_usage_feedback: true
 enable_reset_probe: false
 probe_on_provisional_roster: false
+# 开启 enable_reset_probe 后按北京时间主动检查/激活 5 小时额度；普通 Codex 请求不受时间限制
+probe_send_timezone: Asia/Shanghai
+probe_trigger_times: ["07:00", "12:00", "17:00"]
 max_refresh_concurrency: 1
 quota_endpoint: https://chatgpt.com/backend-api/wham/usage
 circuit_failure_threshold: 5
