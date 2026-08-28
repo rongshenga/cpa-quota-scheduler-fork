@@ -518,7 +518,14 @@ func (r *QuotaRefresher) persistProbeFailure(instance AuthInstanceID, attemptID 
 					window.AttemptID = ""
 				}
 				window.RetryCount++
-				window.Deadline = now.Add(probeBackoff(window.RetryCount))
+				if sent {
+					// A request may have reached the upstream even when its response
+					// was lost; recovery must verify it rather than resend it.
+					window.Deadline = now.Add(probeBackoff(window.RetryCount))
+				} else {
+					cfg := r.state.Config()
+					window.Deadline = probeFailureDeadline(cfg.ProbeTriggerMinutes, cfg.ProbeSendTimezone, now, window.RetryCount)
+				}
 			}
 			next[kind] = window
 		}

@@ -24,6 +24,21 @@ const minutesPerDay = 24 * 60
 
 const probeTriggerGrace = 10 * time.Minute
 
+// probeFailureDeadline returns the next retry deadline for a probe operation.
+// When explicit trigger times are configured, retrying inside the same grace
+// window could send multiple activation requests for one scheduled slot. Push
+// unsent failures to the next trigger so each account gets at most one
+// activation attempt per slot. With no trigger schedule, preserve the
+// upstream exponential-ish backoff behaviour.
+func probeFailureDeadline(triggerMinutes []int, timezone string, now time.Time, retryCount int) time.Time {
+	if len(triggerMinutes) > 0 {
+		if next := nextProbeTriggerAt(triggerMinutes, probeSendLocation(timezone), now); !next.IsZero() {
+			return next
+		}
+	}
+	return now.Add(probeBackoff(retryCount))
+}
+
 // Contains reports whether the given minute-of-day falls inside the window.
 // The start bound is inclusive and the end bound exclusive, so adjacent
 // windows never double-count a single minute.

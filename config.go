@@ -73,23 +73,23 @@ type registrationCapabilities struct {
 }
 
 type rawConfig struct {
-	HandleEnabled                   *bool  `yaml:"handle_enabled"`
-	QuotaRefreshInterval            string `yaml:"quota_refresh_interval"`
-	StaleAfter                      string `yaml:"stale_after"`
-	MonthlyMode                     string `yaml:"monthly_mode"`
-	Fallback                        string `yaml:"fallback"`
-	EnableUsageFeedback             *bool  `yaml:"enable_usage_feedback"`
-	EnableResetProbe                *bool  `yaml:"enable_reset_probe"`
-	ProbeOnProvisionalRoster        *bool  `yaml:"probe_on_provisional_roster"`
-	MaxRefreshConcurrency           *int   `yaml:"max_refresh_concurrency"`
-	QuotaEndpoint                   string `yaml:"quota_endpoint"`
-	RefreshActiveWindow             string `yaml:"refresh_active_window"`
-	RefreshAfterResetDelay          string `yaml:"refresh_after_reset_delay"`
-	RefreshRetryDelays              string `yaml:"refresh_retry_delays"`
-	RefreshOnStartup                *bool  `yaml:"refresh_on_startup"`
-	CircuitFailureThreshold         *int   `yaml:"circuit_failure_threshold"`
-	CircuitOpenDuration             string `yaml:"circuit_open_duration"`
-	CircuitHalfOpenSuccessThreshold *int   `yaml:"circuit_half_open_success_threshold"`
+	HandleEnabled                   *bool    `yaml:"handle_enabled"`
+	QuotaRefreshInterval            string   `yaml:"quota_refresh_interval"`
+	StaleAfter                      string   `yaml:"stale_after"`
+	MonthlyMode                     string   `yaml:"monthly_mode"`
+	Fallback                        string   `yaml:"fallback"`
+	EnableUsageFeedback             *bool    `yaml:"enable_usage_feedback"`
+	EnableResetProbe                *bool    `yaml:"enable_reset_probe"`
+	ProbeOnProvisionalRoster        *bool    `yaml:"probe_on_provisional_roster"`
+	MaxRefreshConcurrency           *int     `yaml:"max_refresh_concurrency"`
+	QuotaEndpoint                   string   `yaml:"quota_endpoint"`
+	RefreshActiveWindow             string   `yaml:"refresh_active_window"`
+	RefreshAfterResetDelay          string   `yaml:"refresh_after_reset_delay"`
+	RefreshRetryDelays              string   `yaml:"refresh_retry_delays"`
+	RefreshOnStartup                *bool    `yaml:"refresh_on_startup"`
+	CircuitFailureThreshold         *int     `yaml:"circuit_failure_threshold"`
+	CircuitOpenDuration             string   `yaml:"circuit_open_duration"`
+	CircuitHalfOpenSuccessThreshold *int     `yaml:"circuit_half_open_success_threshold"`
 	MaxLogEntries                   *int     `yaml:"max_log_entries"`
 	LogRetention                    string   `yaml:"log_retention"`
 	ProbeSendWindows                []string `yaml:"probe_send_windows"`

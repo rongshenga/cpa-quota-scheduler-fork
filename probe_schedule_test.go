@@ -30,12 +30,12 @@ func TestProbeSendAllowedAtUserSchedule(t *testing.T) {
 		hour, min int
 		want      bool
 	}{
-		{7, 0, true},   // window start is inclusive
+		{7, 0, true}, // window start is inclusive
 		{7, 29, true},
 		{7, 30, false}, // window end is exclusive
 		{12, 15, true},
 		{17, 29, true},
-		{3, 0, false},  // overnight: the case this whole feature exists for
+		{3, 0, false}, // overnight: the case this whole feature exists for
 		{22, 0, false},
 		{10, 0, false}, // working, but not an activation slot
 	}
@@ -142,10 +142,27 @@ func TestProbeTriggerAllowedGrace(t *testing.T) {
 	if !probeTriggerAllowedAt(triggers, loc, time.Date(2026, 8, 28, 7, 0, 0, 0, loc)) {
 		t.Fatal("trigger start must be allowed")
 	}
-	if !probeTriggerAllowedAt(triggers, loc, time.Date(2026, 8, 28, 7, 9, 59, 0, 0, loc)) {
+	if !probeTriggerAllowedAt(triggers, loc, time.Date(2026, 8, 28, 7, 9, 59, 0, loc)) {
 		t.Fatal("trigger grace must be allowed")
 	}
 	if probeTriggerAllowedAt(triggers, loc, time.Date(2026, 8, 28, 7, 10, 0, 0, loc)) {
 		t.Fatal("trigger after grace must be rejected")
+	}
+}
+
+func TestProbeFailureDeadlineSkipsRemainderOfTriggerGrace(t *testing.T) {
+	loc := time.FixedZone("CST", 8*60*60)
+	now := time.Date(2026, 8, 28, 7, 1, 0, 0, loc)
+	got := probeFailureDeadline([]int{7 * 60, 12 * 60, 17 * 60}, "Asia/Shanghai", now, 1)
+	want := time.Date(2026, 8, 28, 12, 0, 0, 0, loc)
+	if !got.Equal(want) {
+		t.Fatalf("failure at %s retried at %s, want %s", now, got, want)
+	}
+}
+
+func TestProbeFailureDeadlineKeepsDefaultBackoffWithoutTriggers(t *testing.T) {
+	now := time.Date(2026, 8, 28, 7, 1, 0, 0, time.UTC)
+	if got, want := probeFailureDeadline(nil, "", now, 2), now.Add(5*time.Minute); !got.Equal(want) {
+		t.Fatalf("default retry deadline = %s, want %s", got, want)
 	}
 }
