@@ -1107,7 +1107,21 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 				lazy = append(lazy, k)
 			}
 		}
-		if len(lazy) == 0 {
+		// Clock gate: activation requests are the only quota-consuming step, so
+		// they are held back outside the configured send windows. The read-only
+		// precheck above still ran, keeping classification state fresh; the
+		// window stays lazy and is retried on the next observation cycle, which
+		// lands inside an allowed window. Deferring here (rather than skipping
+		// the whole probe) reuses the existing WAL-safe "nothing to send" path.
+		probeCfg := r.state.Config()
+		sendAllowed := probeSendAllowedAt(probeCfg.ProbeSendWindows, probeSendLocation(probeCfg.ProbeSendTimezone), r.now())
+		if !sendAllowed && len(lazy) > 0 {
+			deferFields := fields(lazy)
+			deferFields["send_windows"] = formatProbeSendWindows(probeCfg.ProbeSendWindows)
+			deferFields["timezone"] = probeCfg.ProbeSendTimezone
+			recordLog("info", "probe.send_deferred", "不在允许的激活时段，本次不发激活请求", deferFields)
+		}
+		if len(lazy) == 0 || !sendAllowed {
 			err = r.persistTerminalProbeCompletionLocked(intent.Instance, attempt.AttemptID, pre.Quota, ProbeAttemptPrepared)
 			r.probeHoldMu.Unlock()
 			if err != nil {

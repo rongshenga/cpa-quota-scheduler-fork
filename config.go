@@ -49,6 +49,11 @@ type Config struct {
 	CircuitHalfOpenSuccessThreshold int
 	MaxLogEntries                   int
 	LogRetention                    time.Duration
+	// ProbeSendWindows restricts when reset-probe activation requests may be
+	// sent. Empty means unrestricted. Read-only quota observation is never
+	// gated by this: it costs no quota and keeps classification accurate.
+	ProbeSendWindows  []probeSendWindow
+	ProbeSendTimezone string
 }
 
 type registration struct {
@@ -81,8 +86,10 @@ type rawConfig struct {
 	CircuitFailureThreshold         *int   `yaml:"circuit_failure_threshold"`
 	CircuitOpenDuration             string `yaml:"circuit_open_duration"`
 	CircuitHalfOpenSuccessThreshold *int   `yaml:"circuit_half_open_success_threshold"`
-	MaxLogEntries                   *int   `yaml:"max_log_entries"`
-	LogRetention                    string `yaml:"log_retention"`
+	MaxLogEntries                   *int     `yaml:"max_log_entries"`
+	LogRetention                    string   `yaml:"log_retention"`
+	ProbeSendWindows                []string `yaml:"probe_send_windows"`
+	ProbeSendTimezone               *string  `yaml:"probe_send_timezone"`
 }
 
 func DefaultConfig() Config {
@@ -287,6 +294,22 @@ func DecodeConfig(raw []byte) (Config, error) {
 			return Config{}, fmt.Errorf("log_retention must be positive")
 		}
 		cfg.LogRetention = d
+	}
+	if decoded.ProbeSendTimezone != nil {
+		name := strings.TrimSpace(*decoded.ProbeSendTimezone)
+		if name != "" {
+			if _, err := time.LoadLocation(name); err != nil {
+				return Config{}, fmt.Errorf("probe_send_timezone: %w", err)
+			}
+		}
+		cfg.ProbeSendTimezone = name
+	}
+	if decoded.ProbeSendWindows != nil {
+		windows, err := parseProbeSendWindows(decoded.ProbeSendWindows)
+		if err != nil {
+			return Config{}, fmt.Errorf("probe_send_windows: %w", err)
+		}
+		cfg.ProbeSendWindows = windows
 	}
 	return NormalizeConfig(cfg), nil
 }
