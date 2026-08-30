@@ -158,6 +158,9 @@ func logSchedulerDecision(store *PluginState, req pluginapi.SchedulerPickRequest
 	if store == nil {
 		return
 	}
+	if !store.ShouldLogSchedulerDecision(decision) {
+		return
+	}
 	level := "info"
 	event := "scheduler.unhandled"
 	message := "请求未由插件接管"

@@ -243,7 +243,10 @@ func TestSchedulerPickRefreshesOnlyActivePriorityCandidates(t *testing.T) {
 
 func TestLogSchedulerDecisionIncludesDetailedFallbackReason(t *testing.T) {
 	now := time.Date(2026, 6, 25, 10, 0, 0, 0, time.UTC)
-	store := NewPluginState(DefaultConfig())
+	// Asserts the field payload, not the recording policy: a fallback is
+	// routine routing and is filtered out of the ring by default, so the
+	// verbose escape hatch is what exercises this path.
+	store := NewPluginState(verboseSchedulerLogConfig())
 	decision := PickDecision{
 		Handled:         true,
 		DelegateBuiltin: pluginapi.SchedulerBuiltinFillFirst,
@@ -274,7 +277,8 @@ func TestLogSchedulerDecisionIncludesDetailedFallbackReason(t *testing.T) {
 
 func TestLogSchedulerDecisionIncludesSelectedAccountContext(t *testing.T) {
 	now := time.Date(2026, 6, 25, 10, 0, 0, 0, time.UTC)
-	store := NewPluginState(DefaultConfig())
+	// As above: a successful selection is filtered by default.
+	store := NewPluginState(verboseSchedulerLogConfig())
 	decision := PickDecision{
 		AuthID:  "auth-1",
 		Handled: true,
@@ -293,4 +297,12 @@ func TestLogSchedulerDecisionIncludesSelectedAccountContext(t *testing.T) {
 	if fields["selected_cpa_priority"] != 8 || fields["selected_scheduler_priority"] != 3 {
 		t.Fatalf("priority fields = %#v, want distinct CPA and scheduler priorities", fields)
 	}
+}
+
+// verboseSchedulerLogConfig turns the scheduler-decision filter off so tests can
+// assert on log payloads that the default policy would not record.
+func verboseSchedulerLogConfig() Config {
+	cfg := DefaultConfig()
+	cfg.LogSchedulerDecisions = true
+	return cfg
 }

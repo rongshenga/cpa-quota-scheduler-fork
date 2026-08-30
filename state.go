@@ -18,6 +18,7 @@ type PluginState struct {
 	lastSelected        string
 	lastReason          string
 	lastCodexActivityAt time.Time
+	lastSchedulerLogKey string
 	lastAuthScanAt      time.Time
 	codexAuthCount      int
 }
@@ -440,6 +441,31 @@ func (s *PluginState) ApplyQuotaRefreshSuccessIfAdmissionCurrent(account Account
 		return false
 	}
 	s.accounts[key] = cloneAccountState(account)
+	return true
+}
+
+// ShouldLogSchedulerDecision applies the scheduler-log policy and, for a fault
+// that passes it, suppresses consecutive repeats of the same fault. Recovery is
+// tracked too: once a non-fault decision is seen the key is cleared, so the
+// fault logs again if it returns.
+func (s *PluginState) ShouldLogSchedulerDecision(decision PickDecision) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !schedulerDecisionLoggable(decision, s.cfg.LogSchedulerDecisions) {
+		s.lastSchedulerLogKey = ""
+		return false
+	}
+	if s.cfg.LogSchedulerDecisions {
+		return true
+	}
+	key := schedulerDecisionDedupKey(decision)
+	if key == s.lastSchedulerLogKey {
+		return false
+	}
+	s.lastSchedulerLogKey = key
 	return true
 }
 

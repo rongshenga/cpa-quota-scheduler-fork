@@ -52,8 +52,11 @@ type Config struct {
 	// ProbeSendWindows restricts when reset-probe activation requests may be
 	// sent. Empty means unrestricted. Read-only quota observation is never
 	// gated by this: it costs no quota and keeps classification accurate.
-	ProbeSendWindows  []probeSendWindow
-	ProbeSendTimezone string
+	// LogSchedulerDecisions restores a ring-buffer entry for every scheduler
+	// pick. Off by default: see scheduler_log_policy.go.
+	LogSchedulerDecisions bool
+	ProbeSendWindows      []probeSendWindow
+	ProbeSendTimezone     string
 	// ProbeTriggerMinutes schedules read-only/activation checks for the
 	// five-hour window. Values are minutes after midnight in the configured
 	// timezone. An empty list preserves the existing reset-deadline behavior.
@@ -92,6 +95,7 @@ type rawConfig struct {
 	CircuitHalfOpenSuccessThreshold *int     `yaml:"circuit_half_open_success_threshold"`
 	MaxLogEntries                   *int     `yaml:"max_log_entries"`
 	LogRetention                    string   `yaml:"log_retention"`
+	LogSchedulerDecisions           *bool    `yaml:"log_scheduler_decisions"`
 	ProbeSendWindows                []string `yaml:"probe_send_windows"`
 	ProbeSendTimezone               *string  `yaml:"probe_send_timezone"`
 	ProbeTriggerTimes               []string `yaml:"probe_trigger_times"`
@@ -300,6 +304,9 @@ func DecodeConfig(raw []byte) (Config, error) {
 			return Config{}, fmt.Errorf("log_retention must be positive")
 		}
 		cfg.LogRetention = d
+	}
+	if decoded.LogSchedulerDecisions != nil {
+		cfg.LogSchedulerDecisions = *decoded.LogSchedulerDecisions
 	}
 	if decoded.ProbeSendTimezone != nil {
 		name := strings.TrimSpace(*decoded.ProbeSendTimezone)

@@ -36,7 +36,9 @@ func TestSchedulerPickABIPathSnapshotOnly(t *testing.T) {
 }
 
 func TestSchedulerPickPublishesManagementObservationAsynchronously(t *testing.T) {
-	store := NewPluginState(DefaultConfig())
+	// Verifies the observation pipeline, not the log-recording policy;
+	// the decision this asserts on is filtered from the ring by default.
+	store := NewPluginState(verboseSchedulerLogConfig())
 
 	refresherMu.Lock()
 	previousState := globalState
@@ -100,7 +102,9 @@ func TestSchedulerPickPublishesManagementObservationAsynchronously(t *testing.T)
 }
 
 func TestDisabledSchedulerStillObservesCodexRequestAsUnhandled(t *testing.T) {
-	store := NewPluginState(DefaultConfig())
+	// Verifies the observation pipeline, not the log-recording policy;
+	// the decision this asserts on is filtered from the ring by default.
+	store := NewPluginState(verboseSchedulerLogConfig())
 
 	refresherMu.Lock()
 	previousState := globalState

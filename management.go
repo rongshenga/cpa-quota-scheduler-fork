@@ -102,6 +102,7 @@ type SettingsPayload struct {
 	CircuitHalfOpenSuccessThreshold int         `json:"circuit_half_open_success_threshold"`
 	MaxLogEntries                   int         `json:"max_log_entries"`
 	LogRetention                    string      `json:"log_retention"`
+	LogSchedulerDecisions           bool        `json:"log_scheduler_decisions"`
 	ProbeSendWindows                string      `json:"probe_send_windows"`
 	ProbeSendTimezone               string      `json:"probe_send_timezone"`
 	ProbeTriggerTimes               string      `json:"probe_trigger_times"`
@@ -383,6 +384,7 @@ func SettingsFromConfig(cfg Config) SettingsPayload {
 		CircuitHalfOpenSuccessThreshold: cfg.CircuitHalfOpenSuccessThreshold,
 		MaxLogEntries:                   cfg.MaxLogEntries,
 		LogRetention:                    cfg.LogRetention.String(),
+		LogSchedulerDecisions:           cfg.LogSchedulerDecisions,
 		ProbeSendWindows:                formatProbeSendWindows(cfg.ProbeSendWindows),
 		ProbeSendTimezone:               cfg.ProbeSendTimezone,
 		ProbeTriggerTimes:               formatProbeTriggerTimes(cfg.ProbeTriggerMinutes),
@@ -471,6 +473,7 @@ func ConfigFromSettings(base Config, payload SettingsPayload) (Config, error) {
 		}
 		cfg.LogRetention = d
 	}
+	cfg.LogSchedulerDecisions = payload.LogSchedulerDecisions
 	if strings.TrimSpace(payload.ProbeSendTimezone) != "" {
 		name := strings.TrimSpace(payload.ProbeSendTimezone)
 		if _, err := time.LoadLocation(name); err != nil {
