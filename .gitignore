@@ -6,6 +6,8 @@ dist/
 *.dll
 *.so
 *.dylib
+# c-shared also emits a companion header next to the library
+*.h
 *.test
 
 # Test artifacts
