@@ -16,13 +16,21 @@ import (
 var (
 	currentConfig          atomic.Value
 	globalState            = NewPluginState(DefaultConfig())
-	globalTrials           = NewTrialRegistry()
+	globalTrialRegistry    atomic.Pointer[TrialRegistry]
 	globalEvidenceIntents  = make(chan EvidenceIntent, 64)
 	evidenceConsumerOnce   sync.Once
 	refresherMu            sync.Mutex
 	globalRefresher        *QuotaRefresher
 	globalRosterController *RosterController
 )
+
+func init() { globalTrialRegistry.Store(NewTrialRegistry()) }
+
+// globalTrials is the process-wide trial registry. The pointer is atomic
+// because the evidence-consumer goroutine reads it for the lifetime of the
+// process while tests swap in an isolated registry; a plain variable would make
+// that swap a data race against a consumer that is mid-intent.
+func globalTrials() *TrialRegistry { return globalTrialRegistry.Load() }
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -118,7 +126,7 @@ func startEvidenceConsumer() {
 }
 
 func consumeEvidenceIntent(intent EvidenceIntent) {
-	globalTrials.MarkEvidencePending(intent.Instance, true)
+	globalTrials().MarkEvidencePending(intent.Instance, true)
 	refresherMu.Lock()
 	r := globalRefresher
 	refresherMu.Unlock()
@@ -267,17 +275,29 @@ func handleManagementHandle(raw []byte) ([]byte, error) {
 	if rosterController == nil {
 		now := time.Now()
 		lifecycle := ManagementLifecycleSnapshot{Roster: ActiveRoster{Capability: CapabilityB, Health: RosterWaiting}}
+		lifecycle.TriggerProbe = manualProbeTrigger(refresher)
 		return okEnvelope(HandleManagementRequestWithLifecycle(globalState, req, now, lifecycle))
 	}
 	active, _ := rosterController.WakeForManagement(context.Background())
 	now := time.Now()
 	lifecycle := ManagementLifecycleSnapshot{Roster: active, CredentialAmbiguous: managementCredentialAmbiguous(refresher, active, now)}
+	lifecycle.TriggerProbe = manualProbeTrigger(refresher)
 	if refresher != nil {
 		lifecycle.ResolveCredential = func(ctx context.Context, authID string, action CredentialResolutionAction) error {
 			return refresher.ResolveCredentialAmbiguity(ctx, active, authID, action)
 		}
 	}
 	return okEnvelope(HandleManagementRequestWithLifecycle(globalState, req, now, lifecycle))
+}
+
+// manualProbeTrigger binds the management /probe/trigger route to the running
+// refresher. It stays nil when nothing is wired up, so the route reports 503
+// rather than silently accepting a pass that can never run.
+func manualProbeTrigger(refresher *QuotaRefresher) func(context.Context) (ManualProbeTriggerResult, error) {
+	if refresher == nil {
+		return nil
+	}
+	return refresher.RunManualProbePass
 }
 
 func managementCredentialAmbiguous(refresher *QuotaRefresher, active ActiveRoster, now time.Time) bool {

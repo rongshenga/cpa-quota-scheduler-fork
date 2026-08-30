@@ -19,10 +19,258 @@ type probeReadResult struct {
 	Credentials CodexCredentials
 }
 type probeSequencePayload struct {
-	Binding  RuntimeBinding
-	Windows  []ProbeWindowKind
-	Attempt  ProbeAttempt
+	Binding RuntimeBinding
+	Windows []ProbeWindowKind
+	Attempt ProbeAttempt
+	// Recovery resumes an attempt whose activation request already left the
+	// process. Manual marks a pass an operator asked for through the
+	// management API, which relaxes the trigger-time gate only.
 	Recovery bool
+	Manual   bool
+}
+
+// probeSendGate is the resolved clock-gate decision for one probe pass. It is
+// evaluated once per decision point so the branch that is taken and the log
+// fields that describe it can never disagree.
+//
+// Gate policy: a manual (operator-issued) trigger IS a trigger, so it satisfies
+// the probe_trigger_times gate. It still honours probe_send_windows, which is a
+// hard "never send activation requests outside these hours" policy rather than
+// a schedule.
+type probeSendGate struct {
+	Manual         bool
+	WindowAllowed  bool
+	TriggerAllowed bool
+	Allowed        bool
+	SendWindows    string
+	TriggerTimes   string
+	Timezone       string
+	Location       *time.Location
+	TriggerMinutes []int
+}
+
+const probeGatePolicy = "manual_bypasses_trigger_times_respects_send_windows"
+
+func (r *QuotaRefresher) evaluateProbeSendGate(now time.Time, manual bool) probeSendGate {
+	var cfg Config
+	if r != nil && r.state != nil {
+		cfg = r.state.Config()
+	}
+	location := probeSendLocation(cfg.ProbeSendTimezone)
+	gate := probeSendGate{
+		Manual:         manual,
+		WindowAllowed:  probeSendAllowedAt(cfg.ProbeSendWindows, location, now),
+		TriggerAllowed: probeTriggerAllowedAt(cfg.ProbeTriggerMinutes, location, now),
+		SendWindows:    formatProbeSendWindows(cfg.ProbeSendWindows),
+		TriggerTimes:   formatProbeTriggerTimes(cfg.ProbeTriggerMinutes),
+		Timezone:       cfg.ProbeSendTimezone,
+		Location:       location,
+		TriggerMinutes: append([]int(nil), cfg.ProbeTriggerMinutes...),
+	}
+	gate.Allowed = gate.WindowAllowed && (gate.TriggerAllowed || manual)
+	return gate
+}
+
+// BypassedTriggerGate reports whether this pass only cleared the gate because
+// an operator asked for it outside the configured trigger times. It stays false
+// when the send window vetoed the pass anyway: nothing was sent, so no trigger
+// time was actually skipped, and a log line claiming otherwise next to
+// send_allowed=false would read as a contradiction.
+func (g probeSendGate) BypassedTriggerGate() bool {
+	return g.Manual && g.Allowed && !g.TriggerAllowed
+}
+
+// apply stamps the gate decision onto a log field set. Every value is derived
+// from configuration or the clock, so nothing here can carry a credential.
+func (g probeSendGate) apply(fields map[string]any) map[string]any {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	fields["manual"] = g.Manual
+	fields["send_allowed"] = g.Allowed
+	fields["trigger_allowed"] = g.TriggerAllowed
+	fields["send_window_allowed"] = g.WindowAllowed
+	fields["manual_bypassed_trigger_gate"] = g.BypassedTriggerGate()
+	fields["gate_policy"] = probeGatePolicy
+	fields["send_windows"] = g.SendWindows
+	fields["trigger_times"] = g.TriggerTimes
+	fields["timezone"] = g.Timezone
+	return fields
+}
+
+// probeFailureDescriptor is the sanitized, enumerated view of a probe failure.
+// Only fixed codes and an HTTP status ever leave this type, so no upstream
+// body, header, token or cookie can reach a log entry or a management response.
+type probeFailureDescriptor struct {
+	Code     string
+	Category string
+	Status   int
+}
+
+func classifyProbeFailure(err error) probeFailureDescriptor {
+	descriptor := probeFailureDescriptor{Code: "probe_operation_failed", Category: "external_callback"}
+	var status quotaStatusError
+	var activation probeActivationError
+	switch {
+	case errors.As(err, &activation):
+		descriptor.Code = activation.Code
+		descriptor.Category = "upstream_business"
+		descriptor.Status = activation.Status
+	case errors.As(err, &status):
+		descriptor.Code = "quota_http_status"
+		descriptor.Category = "upstream_http"
+		descriptor.Status = status.status
+	case errors.Is(err, ErrCapabilityB):
+		descriptor.Code = "background_not_authorized"
+		descriptor.Category = "authorization"
+	case errors.Is(err, ErrAccountIdentityUnresolved):
+		descriptor.Code = "account_identity_unresolved"
+		descriptor.Category = "authorization"
+	case errors.Is(err, ErrProvisionalFingerprintMismatch):
+		descriptor.Code = "credential_fingerprint_mismatch"
+		descriptor.Category = "authorization"
+	case errors.Is(err, context.Canceled):
+		descriptor.Code = "operation_canceled"
+		descriptor.Category = "internal"
+	case errors.Is(err, context.DeadlineExceeded):
+		descriptor.Code = "operation_deadline_exceeded"
+		descriptor.Category = "internal"
+	}
+	return descriptor
+}
+
+// recordProbeScheduleTriggered logs the entry point of a 5h probe pass, for
+// both the wall-clock schedule and an operator-issued manual trigger.
+func (r *QuotaRefresher) recordProbeScheduleTriggered(now time.Time, gate probeSendGate, armed int, armErr error) {
+	if r == nil || r.state == nil {
+		return
+	}
+	fields := gate.apply(map[string]any{
+		"armed_instances": armed,
+		"sent":            false,
+		"at":              formatTime(now),
+		"next_trigger_at": formatTime(r.nextProbeScheduleDeadline(now)),
+	})
+	level := "info"
+	message := "已触发 5 小时额度周期探测排程"
+	if gate.Manual {
+		message = "已按管理接口请求手动触发一次 5 小时额度周期探测"
+	}
+	if armErr != nil {
+		level = "warn"
+		fields["error"] = "probe_schedule_persist_failed"
+		fields["error_category"] = "internal"
+	}
+	r.state.RecordLog(level, "probe.schedule_triggered", message, fields, now)
+}
+
+// beginManualProbe is the manual-trigger dedupe latch: at most one operator
+// pass may be in flight, so a double-click cannot queue two activation rounds.
+//
+// The latch bounds concurrency only. The manual flag itself is deliberately NOT
+// derived from it: it is passed down the owning call as an argument
+// (runProbeDueOnce -> runProbeDuePass -> probeSequencePayload.Manual) so that it
+// is lexically scoped to the pass RunManualProbePass actually owns. Reading it
+// from shared state instead would let a foreign owner - a scheduled pass
+// servicing a rerun, or a recovery pass - observe manual=true merely because an
+// unrelated trigger was in flight, and so claim the trigger-time bypass that
+// only an operator-owned pass may have.
+func (r *QuotaRefresher) beginManualProbe() bool {
+	r.probeRunStateMu.Lock()
+	defer r.probeRunStateMu.Unlock()
+	if r.probeManualDepth > 0 {
+		return false
+	}
+	r.probeManualDepth++
+	return true
+}
+
+func (r *QuotaRefresher) endManualProbe() {
+	r.probeRunStateMu.Lock()
+	if r.probeManualDepth > 0 {
+		r.probeManualDepth--
+	}
+	r.probeRunStateMu.Unlock()
+}
+
+// ManualProbeTriggerResult reports what one operator-issued probe pass did.
+type ManualProbeTriggerResult struct {
+	Manual              bool      `json:"manual"`
+	Owned               bool      `json:"owned"`
+	TriggeredAt         time.Time `json:"triggered_at"`
+	ArmedInstances      int       `json:"armed_instances"`
+	SendAllowed         bool      `json:"send_allowed"`
+	TriggerAllowed      bool      `json:"trigger_allowed"`
+	SendWindowAllowed   bool      `json:"send_window_allowed"`
+	BypassedTriggerGate bool      `json:"manual_bypassed_trigger_gate"`
+	GatePolicy          string    `json:"gate_policy"`
+	SendWindows         string    `json:"send_windows,omitempty"`
+	TriggerTimes        string    `json:"trigger_times,omitempty"`
+	Timezone            string    `json:"timezone,omitempty"`
+}
+
+var (
+	// ErrProbeTriggerInFlight rejects a second concurrent manual trigger.
+	ErrProbeTriggerInFlight = errors.New("manual probe trigger already running")
+	// ErrProbeTriggerDisabled rejects a manual trigger while reset probing is off.
+	ErrProbeTriggerDisabled = errors.New("reset probe is disabled")
+	// ErrProbeTriggerUnavailable reports that no probe runtime is wired up yet.
+	ErrProbeTriggerUnavailable = errors.New("probe runtime unavailable")
+)
+
+// RunManualProbePass arms the 5h windows and runs one probe pass on behalf of
+// an operator. It reuses the scheduled path end to end, so the WAL claim,
+// roster/authorization checks and the single-pass probe lock all still apply;
+// the only difference is that the activation gate treats this as a trigger.
+func (r *QuotaRefresher) RunManualProbePass(ctx context.Context) (ManualProbeTriggerResult, error) {
+	if r == nil || r.probeController == nil || r.runtimeStore == nil {
+		return ManualProbeTriggerResult{}, ErrProbeTriggerUnavailable
+	}
+	if !r.resetProbeEnabled() {
+		return ManualProbeTriggerResult{}, ErrProbeTriggerDisabled
+	}
+	if !r.beginManualProbe() {
+		return ManualProbeTriggerResult{}, ErrProbeTriggerInFlight
+	}
+	defer r.endManualProbe()
+	now := r.now()
+	gate := r.evaluateProbeSendGate(now, true)
+	result := ManualProbeTriggerResult{
+		Manual:              true,
+		TriggeredAt:         now,
+		SendAllowed:         gate.Allowed,
+		TriggerAllowed:      gate.TriggerAllowed,
+		SendWindowAllowed:   gate.WindowAllowed,
+		BypassedTriggerGate: gate.BypassedTriggerGate(),
+		GatePolicy:          probeGatePolicy,
+		SendWindows:         gate.SendWindows,
+		TriggerTimes:        gate.TriggerTimes,
+		Timezone:            gate.Timezone,
+	}
+	armed, armErr := r.armScheduledFiveHourChecks()
+	result.ArmedInstances = armed
+	r.recordProbeScheduleTriggered(now, gate, armed, armErr)
+	if armErr != nil {
+		return result, armErr
+	}
+	owned, err := r.runProbeDueOnce(ctx, true)
+	result.Owned = owned
+	if !owned {
+		// Another pass already owns the probe lock, so this call never executed
+		// an operator-gated pass: the rerun it flagged is serviced by that owner
+		// under the scheduled gate (the manual flag travels with this call, not
+		// with the probe), which is exactly the trigger-time bypass the operator
+		// asked for and would not get. Answering 202 here would therefore be a
+		// false success. Report the conflict instead - the armed windows are already
+		// durable and the existing owner still services them, so retrying the
+		// trigger costs nothing and sends no extra activation POST.
+		r.wakeRefreshLoop()
+		if err == nil {
+			err = ErrProbeTriggerInFlight
+		}
+		return result, err
+	}
+	return result, err
 }
 
 func (r *QuotaRefresher) initProbeRuntime() error {
@@ -240,9 +488,9 @@ func (r *QuotaRefresher) consumeProbeSchedule(now time.Time) bool {
 	return true
 }
 
-func (r *QuotaRefresher) armScheduledFiveHourChecks() error {
+func (r *QuotaRefresher) armScheduledFiveHourChecks() (int, error) {
 	if r == nil || r.probeController == nil || r.runtimeStore == nil {
-		return nil
+		return 0, nil
 	}
 	r.probeHoldMu.Lock()
 	defer r.probeHoldMu.Unlock()
@@ -261,7 +509,7 @@ func (r *QuotaRefresher) armScheduledFiveHourChecks() error {
 			touched[instance] = struct{}{}
 		}
 	}
-	return r.persistProbeInstances(touched)
+	return len(touched), r.persistProbeInstances(touched)
 }
 
 func (r *QuotaRefresher) persistProbeInstances(instances map[AuthInstanceID]struct{}) error {
@@ -414,13 +662,13 @@ func (r *QuotaRefresher) persistTerminalProbeCompletion(instance AuthInstanceID,
 	return r.persistTerminalProbeCompletionLocked(instance, attemptID, quota, phases...)
 }
 
-func (r *QuotaRefresher) persistVerifiedProbeCompletion(instance AuthInstanceID, attemptID string, quota ParsedQuota, phases ...ProbeAttemptPhase) error {
+func (r *QuotaRefresher) persistVerifiedProbeCompletion(instance AuthInstanceID, attemptID string, sendStartedAt time.Time, quota ParsedQuota, phases ...ProbeAttemptPhase) error {
 	if r.runtimeStore == nil || r.probeController == nil || instance == 0 {
 		return nil
 	}
 	r.probeHoldMu.Lock()
 	defer r.probeHoldMu.Unlock()
-	r.probeController.Advance(instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), Snapshots: probeSnapshots(quota)})
+	r.probeController.Advance(instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), SendStartedAt: sendStartedAt, Snapshots: probeSnapshots(quota)})
 	return r.persistTerminalProbeCompletionLocked(instance, attemptID, quota, phases...)
 }
 
@@ -671,19 +919,22 @@ func activeProbeBindings(roster HostRosterSnapshot, bindings map[string]RuntimeB
 }
 
 func (r *QuotaRefresher) RunProbeDueOnce(ctx context.Context) error {
-	_, err := r.runProbeDueOnce(ctx)
+	_, err := r.runProbeDueOnce(ctx, false)
 	return err
 }
 
-func (r *QuotaRefresher) runProbeDueOnce(ctx context.Context) (bool, error) {
-	return r.runProbeDueOnceWithAdmission(ctx, nil)
+// runProbeDueOnce runs one due-probe pass. manual marks a pass an operator
+// asked for through the management API; it stays with this call and is never
+// inherited by another goroutine's pass.
+func (r *QuotaRefresher) runProbeDueOnce(ctx context.Context, manual bool) (bool, error) {
+	return r.runProbeDueOnceWithAdmission(ctx, nil, manual)
 }
 
 func (r *QuotaRefresher) runProbeDueOnceAdmitted(ctx context.Context, generation uint64) (bool, error) {
-	return r.runProbeDueOnceWithAdmission(ctx, &generation)
+	return r.runProbeDueOnceWithAdmission(ctx, &generation, false)
 }
 
-func (r *QuotaRefresher) runProbeDueOnceWithAdmission(ctx context.Context, generation *uint64) (bool, error) {
+func (r *QuotaRefresher) runProbeDueOnceWithAdmission(ctx context.Context, generation *uint64, manual bool) (bool, error) {
 	if !r.resetProbeEnabled() {
 		return false, nil
 	}
@@ -702,7 +953,7 @@ func (r *QuotaRefresher) runProbeDueOnceWithAdmission(ctx context.Context, gener
 	r.probeRunStateMu.Unlock()
 	var firstErr error
 	for {
-		err := r.runProbeDuePass(ctx)
+		err := r.runProbeDuePass(ctx, manual)
 		if firstErr == nil {
 			firstErr = err
 		}
@@ -722,7 +973,7 @@ func (r *QuotaRefresher) runProbeDueOnceWithAdmission(ctx context.Context, gener
 	}
 }
 
-func (r *QuotaRefresher) runProbeDuePass(ctx context.Context) error {
+func (r *QuotaRefresher) runProbeDuePass(ctx context.Context, manual bool) error {
 	if !r.resetProbeEnabled() {
 		return nil
 	}
@@ -824,7 +1075,7 @@ func (r *QuotaRefresher) runProbeDuePass(ctx context.Context) error {
 		if claimed.ProbeAttempts[b.Instance].AttemptID != attempt.AttemptID || attempt.Phase != ProbeAttemptPrepared {
 			continue
 		}
-		result := r.coordinator.SubmitTyped(Intent{AuthID: authID, Instance: b.Instance, Generation: TierGeneration(b.Generation), Class: OperationProbeSequence, Source: SourceProbeActivation, AttemptID: attempt.AttemptID, Token: b.ExecutionToken(0), Login: b.Login, Fingerprint: b.Fingerprint, Payload: probeSequencePayload{Binding: b, Windows: due, Attempt: attempt}}).Await(ctx)
+		result := r.coordinator.SubmitTyped(Intent{AuthID: authID, Instance: b.Instance, Generation: TierGeneration(b.Generation), Class: OperationProbeSequence, Source: SourceProbeActivation, AttemptID: attempt.AttemptID, Token: b.ExecutionToken(0), Login: b.Login, Fingerprint: b.Fingerprint, Payload: probeSequencePayload{Binding: b, Windows: due, Attempt: attempt, Manual: manual}}).Await(ctx)
 		if result.Err != nil {
 			if firstErr == nil {
 				firstErr = result.Err
@@ -946,7 +1197,11 @@ func (r *QuotaRefresher) runProbeRecoveryOwned(ctx context.Context) (runErr erro
 				r.probeController.SetWindow(intent.Instance, kind, window)
 			}
 		}
-		intent.Payload = probeSequencePayload{Binding: binding, Windows: windows, Attempt: attempt, Recovery: true}
+		// Manual is false by construction: recovery resumes an activation another
+		// pass already authorized and sends nothing itself, so it must describe
+		// that earlier decision rather than borrow a concurrent operator trigger's
+		// trigger-time bypass.
+		intent.Payload = probeSequencePayload{Binding: binding, Windows: windows, Attempt: attempt, Recovery: true, Manual: false}
 		result := r.coordinator.SubmitTyped(intent).Await(ctx)
 		if result.Err != nil {
 			if firstErr == nil {
@@ -973,7 +1228,7 @@ func (r *QuotaRefresher) finishProbeRecoveryOwner(ctx context.Context) error {
 		}
 		r.probeRerunPending = false
 		r.probeRunStateMu.Unlock()
-		if err := r.runProbeDuePass(ctx); err != nil {
+		if err := r.runProbeDuePass(ctx, false); err != nil {
 			r.finishProbeOwnerError(true)
 			return err
 		}
@@ -1052,6 +1307,47 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		fields := func(windows []ProbeWindowKind) map[string]any {
 			return map[string]any{"auth_id": intent.AuthID, "attempt_id": attempt.AttemptID, "windows": append([]ProbeWindowKind(nil), windows...)}
 		}
+		// activationStatus is the HTTP status of the activation POST, or 0 when
+		// no status was ever observed (transport failure, or a recovery pass
+		// resuming a send that left in an earlier process).
+		activationStatus := 0
+		// gateFields is the common shape of every probe lifecycle log entry:
+		// who, which attempt, which windows, whether an activation request has
+		// already left the process, when, and how the clock gate resolved.
+		gateFields := func(gate probeSendGate, windows []ProbeWindowKind, sent bool) map[string]any {
+			entry := fields(windows)
+			entry["recovery"] = p.Recovery
+			entry["sent"] = sent
+			entry["at"] = formatTime(r.now())
+			if sent {
+				// Name the endpoint the activation really used, as a fixed
+				// label rather than the URL. activation_http_status is kept
+				// separate from http_status because a pass can fail on the
+				// verify read long after the activation POST succeeded, and
+				// one status field would then describe the wrong request.
+				entry["activation_endpoint"] = codexResetProbeEndpointLabel
+				if activationStatus != 0 {
+					entry["activation_http_status"] = activationStatus
+				}
+			}
+			return gate.apply(entry)
+		}
+		// sendDecisionGate is the gate that actually authorized the activation
+		// POST. Once a request has left the process, every log line describing
+		// that attempt must quote this decision rather than re-evaluate the
+		// clock: a pass that starts inside an allowed window and fails after
+		// the grace boundary would otherwise report sent=true next to
+		// send_allowed=false, which reads as a contradiction and as if the send
+		// had bypassed the gate. Pre-send entries keep evaluating the clock at
+		// the moment they are written, because for them the current decision is
+		// the truth.
+		var sendDecisionGate *probeSendGate
+		eventFields := func(windows []ProbeWindowKind, sent bool) map[string]any {
+			if sent && sendDecisionGate != nil {
+				return gateFields(*sendDecisionGate, windows, sent)
+			}
+			return gateFields(r.evaluateProbeSendGate(r.now(), p.Manual), windows, sent)
+		}
 		recordLog := func(level, event, message string, fields map[string]any) {
 			if r.state != nil {
 				r.state.RecordLog(level, event, message, fields, r.now())
@@ -1076,32 +1372,14 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			return probeReadResult{Quota: quota, Credentials: credentials}, err
 		}
 		recordFailure := func(err error, sent bool, windows []ProbeWindowKind) {
-			failureFields := fields(windows)
-			failureFields["error"] = "probe_operation_failed"
-			failureFields["error_category"] = "external_callback"
-			var status quotaStatusError
-			switch {
-			case errors.As(err, &status):
-				failureFields["error"] = "quota_http_status"
-				failureFields["error_category"] = "upstream_http"
-				failureFields["http_status"] = status.status
-			case errors.Is(err, ErrCapabilityB):
-				failureFields["error"] = "background_not_authorized"
-				failureFields["error_category"] = "authorization"
-			case errors.Is(err, ErrAccountIdentityUnresolved):
-				failureFields["error"] = "account_identity_unresolved"
-				failureFields["error_category"] = "authorization"
-			case errors.Is(err, ErrProvisionalFingerprintMismatch):
-				failureFields["error"] = "credential_fingerprint_mismatch"
-				failureFields["error_category"] = "authorization"
-			case errors.Is(err, context.Canceled):
-				failureFields["error"] = "operation_canceled"
-				failureFields["error_category"] = "internal"
-			case errors.Is(err, context.DeadlineExceeded):
-				failureFields["error"] = "operation_deadline_exceeded"
-				failureFields["error_category"] = "internal"
+			failureFields := eventFields(windows, sent)
+			descriptor := classifyProbeFailure(err)
+			failureFields["error"] = descriptor.Code
+			failureFields["error_category"] = descriptor.Category
+			if descriptor.Status != 0 {
+				failureFields["http_status"] = descriptor.Status
 			}
-			failureFields["sent"] = sent
+			failureFields["failed_at"] = formatTime(r.now())
 			recordLog("warn", "probe.failed", "额度周期探测失败，已按安全策略处理", failureFields)
 		}
 		fail := func(err error, sent bool) OperationResult {
@@ -1137,6 +1415,23 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			return OperationResult{Token: intent.Token, Err: err}
 		}
 		if p.Recovery {
+			// The send this recovery resumes was authorized in an earlier pass,
+			// at attempt.CreatedAt. Quote the gate as of that instant so the
+			// resumed attempt's logs describe the decision that produced the
+			// in-flight request, not the clock at recovery time.
+			if !attempt.CreatedAt.IsZero() {
+				recoveredGate := r.evaluateProbeSendGate(attempt.CreatedAt, p.Manual)
+				sendDecisionGate = &recoveredGate
+			}
+			// A recovery sequence resumes an attempt whose activation request is
+			// still in flight, and that request holds the plugin-state read lock
+			// for its whole flight (the background-request linearization fence in
+			// doBackgroundHTTPRequest). RecordLog takes the same lock for writing,
+			// so anything logged here would park this sequence behind an orphaned
+			// POST that may never return - including the durable completion commit
+			// below, which is what actually retires the attempt. Recovery
+			// therefore commits first and only then describes what it did; do not
+			// add a log statement above persistVerifiedProbeCompletion.
 			if attempt.SendFenceSeq == 0 {
 				attempt.SendFenceSeq = intent.StartedAfter
 			}
@@ -1154,16 +1449,19 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			if err != nil {
 				return fail(err, true)
 			}
-			if err = r.persistVerifiedProbeCompletion(intent.Instance, attempt.AttemptID, vr.Quota, ProbeAttemptSending, ProbeAttemptSent, ProbeAttemptSentUnknown); err != nil {
+			if err = r.persistVerifiedProbeCompletion(intent.Instance, attempt.AttemptID, attempt.CreatedAt, vr.Quota, ProbeAttemptSending, ProbeAttemptSent, ProbeAttemptSentUnknown); err != nil {
 				recordFailure(err, true, p.Windows)
 				return OperationResult{Token: intent.Token, Err: err}
 			}
-			recordLog("info", "probe.verified", "额度周期激活验证完成", fields(p.Windows))
+			verifiedFields := eventFields(p.Windows, true)
+			verifiedFields["verified_at"] = formatTime(r.now())
+			recordLog("info", "probe.verified", "额度周期激活验证完成", verifiedFields)
 			res.ReadStartSeq = seq
 			res.Value = vr
 			return res
 		}
-		recordLog("info", "probe.precheck_started", "开始检查疑似未激活的额度周期", fields(p.Windows))
+		recordLog("info", "probe.sequence_started", "开始执行额度周期探测流程", eventFields(p.Windows, false))
+		recordLog("info", "probe.precheck_started", "开始检查疑似未激活的额度周期", eventFields(p.Windows, false))
 		_, err := r.probeFence.Next() // actual-start precheck sequence, distinct from completedFence
 		if err != nil {
 			return fail(err, false)
@@ -1188,20 +1486,25 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		// window stays lazy and is retried on the next observation cycle, which
 		// lands inside an allowed window. Deferring here (rather than skipping
 		// the whole probe) reuses the existing WAL-safe "nothing to send" path.
-		probeCfg := r.state.Config()
+		// A manual trigger clears the trigger-time half of the gate but not the
+		// send-window half; see probeSendGate.
 		now := r.now()
-		location := probeSendLocation(probeCfg.ProbeSendTimezone)
-		sendAllowed := probeSendAllowedAt(probeCfg.ProbeSendWindows, location, now) && probeTriggerAllowedAt(probeCfg.ProbeTriggerMinutes, location, now)
+		gate := r.evaluateProbeSendGate(now, p.Manual)
+		sendAllowed := gate.Allowed
+		sendDecisionGate = &gate
+		resultFields := gateFields(gate, p.Windows, false)
+		resultFields["lazy_windows"] = append([]ProbeWindowKind(nil), lazy...)
+		resultFields["activation_required"] = len(lazy) > 0
+		resultFields["checked_at"] = formatTime(now)
+		recordLog("info", "probe.precheck_result", "额度周期只读检查完成", resultFields)
 		if !sendAllowed && len(lazy) > 0 {
-			deferFields := fields(lazy)
-			deferFields["send_windows"] = formatProbeSendWindows(probeCfg.ProbeSendWindows)
-			deferFields["timezone"] = probeCfg.ProbeSendTimezone
-			deferFields["trigger_times"] = formatProbeTriggerTimes(probeCfg.ProbeTriggerMinutes)
-			recordLog("info", "probe.send_deferred", "不在允许的激活时段，本次不发激活请求", deferFields)
 			deferUntil := now.Add(r.probeObservationInterval())
-			if next := nextProbeTriggerAt(probeCfg.ProbeTriggerMinutes, location, now); !next.IsZero() {
+			if next := nextProbeTriggerAt(gate.TriggerMinutes, gate.Location, now); !next.IsZero() {
 				deferUntil = next
 			}
+			deferFields := gateFields(gate, lazy, false)
+			deferFields["deferred_until"] = formatTime(deferUntil)
+			recordLog("info", "probe.send_deferred", "不在允许的激活时段，本次不发激活请求", deferFields)
 			for _, k := range lazy {
 				if w, ok := r.probeController.Window(intent.Instance, k); ok {
 					w.State = ProbeRetryWait
@@ -1234,14 +1537,25 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			return fail(err, false)
 		}
 		held.MarkProbeSent(attempt.SuppressUntil)
+		// Only the status code is retained: the response body and every request
+		// header stay inside this closure so no bearer token, account id or
+		// upstream cookie can reach a log entry.
 		err = held.DoHTTP(ctx, func(context.Context) error {
 			return r.probeWAL.ExecuteSend(func() error {
-				resp, e := r.doBackgroundHTTPRequest(pluginapi.HTTPRequest{Method: http.MethodPost, URL: codexResetProbeEndpoint, Headers: http.Header{"Authorization": []string{"Bearer " + pre.Credentials.AccessToken}, "Chatgpt-Account-Id": []string{pre.Credentials.ChatGPTAccountID}, "Content-Type": []string{"application/json"}}, Body: resetProbePayloadBytes()}, true)
+				resp, e := r.doBackgroundHTTPRequest(codexResetProbeRequest(pre.Credentials), true)
 				if e != nil {
 					return e
 				}
+				activationStatus = resp.StatusCode
 				if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 					return quotaStatusError{status: resp.StatusCode, body: resp.Body}
+				}
+				// stream=true answers are SSE, so upstream can refuse the
+				// generation under a 200. Reporting that refusal keeps a
+				// business failure visible instead of recording an activation
+				// that never happened.
+				if code, rejected := codexActivationRejection(resp.Body); rejected {
+					return probeActivationError{Code: code, Status: resp.StatusCode}
 				}
 				return nil
 			})
@@ -1249,11 +1563,15 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		if err != nil {
 			return fail(err, true)
 		}
-		if err = r.probeWAL.PersistSent(intent.Instance, attempt.AttemptID, r.now()); err != nil {
+		sentAt := r.now()
+		if err = r.probeWAL.PersistSent(intent.Instance, attempt.AttemptID, sentAt); err != nil {
 			return fail(err, true)
 		}
-		recordLog("info", "probe.activation_sent", "已发送极小请求以激活额度周期", fields(lazy))
-		if err = held.WaitPropagation(ctx, 3*time.Second); err != nil {
+		sentFields := gateFields(gate, lazy, true)
+		sentFields["http_status"] = activationStatus
+		sentFields["sent_at"] = formatTime(sentAt)
+		recordLog("info", "probe.activation_sent", "已发送极小请求以激活额度周期", sentFields)
+		if err = held.WaitPropagation(ctx, probeActivationVerifyDelay); err != nil {
 			return fail(err, true)
 		}
 		seq, err := r.probeFence.Next()
@@ -1268,7 +1586,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			return fail(err, true)
 		}
 		r.probeHoldMu.Lock()
-		r.probeController.Advance(intent.Instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), Snapshots: probeSnapshots(vr.Quota)})
+		r.probeController.Advance(intent.Instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), SendStartedAt: attempt.CreatedAt, Snapshots: probeSnapshots(vr.Quota)})
 		for _, k := range lazy {
 			if w, ok := r.probeController.Window(intent.Instance, k); ok && w.State == ProbeRetryWait && w.Deadline.Before(attempt.SuppressUntil) {
 				w.Deadline = attempt.SuppressUntil
@@ -1281,7 +1599,10 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			recordFailure(err, true, lazy)
 			return OperationResult{Token: intent.Token, Err: err}
 		}
-		recordLog("info", "probe.verified", "额度周期激活验证完成", fields(lazy))
+		verifiedFields := gateFields(gate, lazy, true)
+		verifiedFields["http_status"] = activationStatus
+		verifiedFields["verified_at"] = formatTime(r.now())
+		recordLog("info", "probe.verified", "额度周期激活验证完成", verifiedFields)
 		res.ReadStartSeq = seq
 		res.Value = vr
 		return res

@@ -4,10 +4,29 @@ import "time"
 
 const (
 	probeSkewTolerance          = 120 * time.Second
+	probeActivationVerifyDelay  = 5 * time.Second
+	probeAnchoredResetTolerance = 2 * time.Second
 	probeMaxPlausibleWindow     = 120 * 24 * time.Hour
 	probeUnknownResetRecheck    = 30 * time.Minute
 	probeRefreshAfterResetDelay = time.Minute
 )
+
+// resetAnchoredAfterActivation distinguishes a newly anchored quota window
+// from a lazy projection. A lazy reset moves forward with the observation
+// clock; an activated reset remains fixed. This narrow, send-scoped check must
+// not reuse the broad clock-skew tolerance used for observations across hosts.
+func resetAnchoredAfterActivation(base ProbeBaseline, snap QuotaSnapshot, sendStartedAt, observedAt time.Time) bool {
+	if !base.SuspectedLazy || !snap.Valid || snap.ResetAt == nil || snap.Usage == nil || sendStartedAt.IsZero() || observedAt.IsZero() {
+		return false
+	}
+	if observedAt.Sub(sendStartedAt) < probeActivationVerifyDelay-probeAnchoredResetTolerance {
+		return false
+	}
+	if !base.ResetAt.After(observedAt) || !snap.ResetAt.After(observedAt) {
+		return false
+	}
+	return absDuration(snap.ResetAt.Sub(base.ResetAt)) <= probeAnchoredResetTolerance
+}
 
 type ProbeBaselineKind string
 

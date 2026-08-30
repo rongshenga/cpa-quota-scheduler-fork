@@ -206,7 +206,7 @@ func TestQuotaLimitFeedbackRepublishesExhaustionWithoutRosterMutation(t *testing
 	store.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, Priority: 9, AuthIDs: map[string]struct{}{"limited": {}}})
 	store.UpsertQuota(AccountState{AuthID: "limited", AuthIndex: "idx-limited", Instance: 61, Provider: "codex", Priority: 9})
 	withGlobalRefresherForTest(t, store, nil)
-	globalTrials.ObserveEvidence(61, Evidence{Kind: EvidenceRequestSuccess, At: now})
+	globalTrials().ObserveEvidence(61, Evidence{Kind: EvidenceRequestSuccess, At: now})
 	publishSchedulerState(store, map[string]struct{}{"limited": {}}, now)
 	pickRaw, _ := json.Marshal(pluginapi.SchedulerPickRequest{Provider: "codex", Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "limited", Provider: "codex", Priority: 9}}})
 	firstRaw, err := handleSchedulerPick(pickRaw)
@@ -245,7 +245,7 @@ func TestQuotaLimitFeedbackRepublishesExhaustionWithoutRosterMutation(t *testing
 	if second.AuthID != "" || !second.Handled || second.DelegateBuiltin != pluginapi.SchedulerBuiltinFillFirst {
 		t.Fatalf("limited account retrialed: %#v", second)
 	}
-	if globalTrials.State(61, now) != TrialNone {
+	if globalTrials().State(61, now) != TrialNone {
 		t.Fatal("excluded quota-limit account started a new trial")
 	}
 	admission := store.CPAAdmission()
@@ -256,13 +256,12 @@ func TestQuotaLimitFeedbackRepublishesExhaustionWithoutRosterMutation(t *testing
 
 func TestEvidenceConsumerMarksPendingAndQueueFullIsNonblocking(t *testing.T) {
 	now := time.Now()
-	previous := globalTrials
-	globalTrials = NewTrialRegistry()
-	t.Cleanup(func() { globalTrials = previous })
-	globalTrials.TryBegin(21, now)
+	previous := globalTrialRegistry.Swap(NewTrialRegistry())
+	t.Cleanup(func() { globalTrialRegistry.Store(previous) })
+	globalTrials().TryBegin(21, now)
 	consumeEvidenceIntent(EvidenceIntent{AuthID: "a", Instance: 21, BeganAt: now})
-	globalTrials.Advance(21, now.Add(60*time.Second))
-	if globalTrials.State(21, now) != TrialActive {
+	globalTrials().Advance(21, now.Add(60*time.Second))
+	if globalTrials().State(21, now) != TrialActive {
 		t.Fatal("consumer did not retain pending trial at 60s")
 	}
 	trials := NewTrialRegistry()

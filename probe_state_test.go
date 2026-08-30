@@ -101,6 +101,56 @@ func TestProbeControllerUsageOnlyZeroWithoutResetDoesNotSend(t *testing.T) {
 	}
 }
 
+func TestProbeVerifyConfirmsFixedResetAfterFiveSeconds(t *testing.T) {
+	sentAt := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	resetAt := sentAt.Add(5 * time.Hour)
+	base := ResetProbeBaseline(resetAt, 0, 5*time.Hour)
+	base.WindowKind = WindowFiveHour
+	base.SuspectedLazy = true
+	c := NewProbeController(sentAt)
+	c.SetWindow(1, ProbeWindowFiveHour, ProbeWindow{State: ProbeSentAwaitingVerify, Baseline: base, AttemptID: "probe-1"})
+
+	c.Advance(1, ProbeEvent{
+		Kind:          ProbeEventVerifyResult,
+		Window:        ProbeWindowFiveHour,
+		Now:           sentAt.Add(probeActivationVerifyDelay),
+		SendStartedAt: sentAt,
+		Snapshots: map[ProbeWindowKind]QuotaSnapshot{
+			ProbeWindowFiveHour: {Valid: true, ResetAt: ptrTime(resetAt), Usage: ptrFloat(0), WindowKind: WindowFiveHour, WindowLength: 5 * time.Hour, WindowLengthKnown: true},
+		},
+	})
+
+	window, ok := c.Window(1, ProbeWindowFiveHour)
+	if !ok || window.State != ProbeConfirmed || window.Baseline.SuspectedLazy || !window.Deadline.IsZero() || window.AttemptID != "" {
+		t.Fatalf("window = %#v, ok=%v; want fixed reset confirmed after one five-second read", window, ok)
+	}
+}
+
+func TestProbeVerifyDoesNotConfirmSlidingResetAfterFiveSeconds(t *testing.T) {
+	sentAt := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	resetAt := sentAt.Add(5 * time.Hour)
+	base := ResetProbeBaseline(resetAt, 0, 5*time.Hour)
+	base.WindowKind = WindowFiveHour
+	base.SuspectedLazy = true
+	c := NewProbeController(sentAt)
+	c.SetWindow(1, ProbeWindowFiveHour, ProbeWindow{State: ProbeSentAwaitingVerify, Baseline: base, AttemptID: "probe-1"})
+
+	c.Advance(1, ProbeEvent{
+		Kind:          ProbeEventVerifyResult,
+		Window:        ProbeWindowFiveHour,
+		Now:           sentAt.Add(probeActivationVerifyDelay),
+		SendStartedAt: sentAt,
+		Snapshots: map[ProbeWindowKind]QuotaSnapshot{
+			ProbeWindowFiveHour: {Valid: true, ResetAt: ptrTime(resetAt.Add(probeActivationVerifyDelay)), Usage: ptrFloat(0), WindowKind: WindowFiveHour, WindowLength: 5 * time.Hour, WindowLengthKnown: true},
+		},
+	})
+
+	window, ok := c.Window(1, ProbeWindowFiveHour)
+	if !ok || window.State != ProbeRetryWait {
+		t.Fatalf("window = %#v, ok=%v; a reset that slides with the clock must not be confirmed", window, ok)
+	}
+}
+
 func TestProbeRosterConfirmedRestoresSuspectedLazyToPendingCheck(t *testing.T) {
 	now := time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)
 	base := ResetProbeBaseline(now.Add(7*24*time.Hour), 0, 7*24*time.Hour)

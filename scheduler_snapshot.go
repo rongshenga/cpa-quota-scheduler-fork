@@ -152,7 +152,7 @@ func publishSchedulerState(state *PluginState, active map[string]struct{}, now t
 	if active != nil {
 		s.CPAAdmission = CPAAdmissionState{Observed: true, AuthIDs: cloneStringSet(active)}
 	}
-	snapshot := schedulerSnapshotFromState(s, globalTrials)
+	snapshot := schedulerSnapshotFromState(s, globalTrials())
 	_, snapshot.AdmissionVersion = state.CPAAdmissionVersioned()
 	PublishSchedulerSnapshot(snapshot)
 }

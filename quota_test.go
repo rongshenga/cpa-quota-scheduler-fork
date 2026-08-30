@@ -34,6 +34,22 @@ func TestParseCodexUsageWeeklyWindows(t *testing.T) {
 	}
 }
 
+func TestParseCodexUsageUnixSecondResetAt(t *testing.T) {
+	want := time.Unix(1788086563, 0).UTC()
+	for _, raw := range []string{
+		`{"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":1788086563}}}`,
+		`{"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":"1788086563"}}}`,
+	} {
+		parsed, err := ParseCodexUsagePayload([]byte(raw), time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if parsed.FiveHour == nil || !parsed.FiveHour.ResetAt.Equal(want) {
+			t.Fatalf("reset_at from %s = %#v, want %s", raw, parsed.FiveHour, want)
+		}
+	}
+}
+
 func TestParseCodexUsageResetCreditsExpiryList(t *testing.T) {
 	now := time.Date(2026, 6, 21, 9, 0, 0, 0, time.UTC)
 	raw := []byte(`{

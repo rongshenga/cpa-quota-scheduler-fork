@@ -40,6 +40,10 @@ type sequenceProbeHost struct {
 	releaseDo     chan struct{}
 	afterDo       func(pluginapi.HTTPRequest)
 	gateDoURL     string
+	// probeStatus / probeBody override the activation endpoint's answer so a
+	// test can drive an upstream rejection. Zero values keep the default 2xx.
+	probeStatus int
+	probeBody   []byte
 }
 
 type probeHandoffClock struct {
@@ -273,7 +277,15 @@ func (h *sequenceProbeHost) Do(req pluginapi.HTTPRequest) (pluginapi.HTTPRespons
 	}
 	var response pluginapi.HTTPResponse
 	if req.URL == codexResetProbeEndpoint {
-		response = pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"usage":{"total_tokens":1}}`)}
+		status := h.probeStatus
+		if status == 0 {
+			status = http.StatusOK
+		}
+		body := h.probeBody
+		if body == nil {
+			body = []byte(`{"usage":{"total_tokens":1}}`)
+		}
+		response = pluginapi.HTTPResponse{StatusCode: status, Body: body}
 	} else if req.URL == resetCreditsEndpoint {
 		response = pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{}`)}
 	} else {
@@ -1514,7 +1526,7 @@ func TestFirstObservedWeeklyLazyWindowSendsOneActivationAndVerifies(t *testing.T
 			events = append(events, entry.Event)
 		}
 	}
-	want := []string{"probe.precheck_started", "probe.activation_sent", "probe.verified"}
+	want := []string{"probe.sequence_started", "probe.precheck_started", "probe.precheck_result", "probe.activation_sent", "probe.verified"}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("Probe events = %v, want %v", events, want)
 	}
@@ -5120,10 +5132,9 @@ func TestProductionProbeRunsWhileNormalRefreshDormant(t *testing.T) {
 	state.ReplaceCPAAdmission(CPAAdmissionState{Observed: true, Priority: 9, AuthIDs: map[string]struct{}{"a": {}}})
 	instance := legacyAuthInstanceID("a")
 	state.UpsertQuota(AccountState{AuthID: "a", AuthIndex: "idx", Instance: instance, TemporaryExhausted: true, TemporaryResetAt: now.Add(time.Hour), Circuit: CircuitBreakerState{State: CircuitStateOpen, FailureCount: 7}, Quota: ParsedQuota{FiveHour: &QuotaWindow{Kind: WindowFiveHour, ResetAt: now.Add(-time.Hour), UsedPercent: ptrFloat(80), Exhausted: true}}})
-	previousTrials := globalTrials
-	globalTrials = NewTrialRegistry()
-	globalTrials.TryBegin(instance, now)
-	t.Cleanup(func() { globalTrials = previousTrials })
+	previousTrials := globalTrialRegistry.Swap(NewTrialRegistry())
+	globalTrials().TryBegin(instance, now)
+	t.Cleanup(func() { globalTrialRegistry.Store(previousTrials) })
 	roster := HostRosterSnapshot{Capability: CapabilityA, Entries: []RosterEntry{{ID: "a", AuthIndex: "idx", Provider: "codex", Priority: intPtr(9)}}}
 	adapter := &rosterCredentialHost{host: host, roster: roster}
 	r, err := NewProductionQuotaRefresher(host, state, adapter, roster, filepath.Join(t.TempDir(), "state.json"), func() time.Time { return now })
@@ -5160,8 +5171,8 @@ func TestProductionProbeRunsWhileNormalRefreshDormant(t *testing.T) {
 		t.Fatalf("window=%#v ok=%v", w, ok)
 	}
 	a := accountByAuthID(t, state.Snapshot(now), "a")
-	if a.Circuit.FailureCount != 7 || a.Circuit.State != CircuitStateOpen || globalTrials.State(instance, now) != TrialActive {
-		t.Fatalf("probe mutated business state circuit=%#v trial=%v", a.Circuit, globalTrials.State(instance, now))
+	if a.Circuit.FailureCount != 7 || a.Circuit.State != CircuitStateOpen || globalTrials().State(instance, now) != TrialActive {
+		t.Fatalf("probe mutated business state circuit=%#v trial=%v", a.Circuit, globalTrials().State(instance, now))
 	}
 }
 
@@ -5753,5 +5764,435 @@ func TestProductionProbeHasNoSplitSendExecutor(t *testing.T) {
 	source := string(raw)
 	if strings.Contains(source, "case OperationProbeSend:") || strings.Contains(source, "type probeSendPayload struct") {
 		t.Fatal("superseded split probe-send production executor remains")
+	}
+}
+
+// newManualProbeRuntime builds a runtime whose single account has a due,
+// suspected-lazy 5h window, then applies the caller's schedule configuration.
+func newManualProbeRuntime(t *testing.T, now time.Time, apply func(*Config)) (*QuotaRefresher, *sequenceProbeHost, RuntimeBinding) {
+	t.Helper()
+	oldReset := now.Add(2 * time.Hour)
+	newReset := now.Add(5 * time.Hour)
+	lazy := []byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":%q}}}`, newReset.Format(time.RFC3339)))
+	active := []byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_at":%q}}}`, newReset.Format(time.RFC3339)))
+	host := newProbeFixtureHost()
+	for i := 0; i < 8; i++ {
+		host.quota = append(host.quota, lazy, active)
+	}
+	r := newDueProbeRuntime(t, now, host)
+	binding, ok := r.bindings.Lookup("a")
+	if !ok {
+		t.Fatal("binding missing")
+	}
+	// An observed reset with zero usage is the suspected-lazy shape the probe
+	// exists for, so the pass reaches the activation decision point.
+	r.probeController.SetWindow(binding.Instance, ProbeWindowFiveHour, ProbeWindow{
+		State:    ProbePendingCheck,
+		Baseline: ResetProbeBaseline(oldReset, 20, 5*time.Hour),
+	})
+	if err := r.persistProbeWindows(); err != nil {
+		t.Fatal(err)
+	}
+	if apply != nil {
+		cfg := r.state.Config()
+		apply(&cfg)
+		r.state.ReplaceConfig(cfg)
+	}
+	return r, host, binding
+}
+
+func probeEventFields(t *testing.T, r *QuotaRefresher, now time.Time, event string) map[string]any {
+	t.Helper()
+	for _, entry := range r.state.Snapshot(now).Logs {
+		if entry.Event == event {
+			return entry.Fields
+		}
+	}
+	t.Fatalf("missing %s log in %#v", event, r.state.Snapshot(now).Logs)
+	return nil
+}
+
+func TestManualProbeTriggerBypassesTriggerTimesButNotSendWindows(t *testing.T) {
+	// 03:00 UTC is deliberately not one of the configured trigger times, so the
+	// scheduled path would never send here. Only the send-window half of the
+	// gate may still veto an operator-issued pass.
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+
+	t.Run("bypasses trigger times", func(t *testing.T) {
+		r, host, binding := newManualProbeRuntime(t, now, func(cfg *Config) {
+			cfg.ProbeSendTimezone = "UTC"
+			cfg.ProbeSendWindows = mustWindows(t, "02:00-04:00")
+			cfg.ProbeTriggerMinutes = []int{7 * 60}
+		})
+		result, err := r.RunManualProbePass(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.Manual || !result.Owned || !result.SendAllowed || result.TriggerAllowed || !result.SendWindowAllowed || !result.BypassedTriggerGate {
+			t.Fatalf("result = %#v, want an owned manual pass that cleared only the trigger gate", result)
+		}
+		if result.GatePolicy != probeGatePolicy {
+			t.Fatalf("GatePolicy = %q, want %q", result.GatePolicy, probeGatePolicy)
+		}
+		if posts, urls := probePOSTCount(host); posts != 1 {
+			t.Fatalf("probe POST count = %d, want 1; urls=%v", posts, urls)
+		}
+		window, ok := r.probeController.Window(binding.Instance, ProbeWindowFiveHour)
+		if !ok || window.State != ProbeConfirmed {
+			t.Fatalf("window = %#v, ok=%v, want Confirmed", window, ok)
+		}
+		fields := probeEventFields(t, r, now, "probe.activation_sent")
+		if fields["manual"] != true || fields["manual_bypassed_trigger_gate"] != true || fields["send_window_allowed"] != true {
+			t.Fatalf("activation_sent gate fields = %#v", fields)
+		}
+	})
+
+	t.Run("respects send windows", func(t *testing.T) {
+		r, host, binding := newManualProbeRuntime(t, now, func(cfg *Config) {
+			cfg.ProbeSendTimezone = "UTC"
+			cfg.ProbeSendWindows = mustWindows(t, "07:00-08:00")
+			cfg.ProbeTriggerMinutes = []int{7 * 60}
+		})
+		result, err := r.RunManualProbePass(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.SendAllowed || result.SendWindowAllowed || result.BypassedTriggerGate {
+			t.Fatalf("result = %#v, want the send window to veto the manual pass", result)
+		}
+		if posts, urls := probePOSTCount(host); posts != 0 {
+			t.Fatalf("probe POST count = %d, want 0 outside the send window; urls=%v", posts, urls)
+		}
+		window, ok := r.probeController.Window(binding.Instance, ProbeWindowFiveHour)
+		if !ok || window.State != ProbeRetryWait {
+			t.Fatalf("window = %#v, ok=%v, want RetryWait", window, ok)
+		}
+		fields := probeEventFields(t, r, now, "probe.send_deferred")
+		if fields["manual"] != true || fields["send_allowed"] != false || fields["send_window_allowed"] != false {
+			t.Fatalf("send_deferred gate fields = %#v", fields)
+		}
+		if fields["trigger_allowed"] != false || fields["manual_bypassed_trigger_gate"] != false {
+			t.Fatalf("send_deferred must not report a bypass it never granted: %#v", fields)
+		}
+	})
+}
+
+func TestManualProbeTriggerArmsFiveHourWindowsAndRetiresWALClaim(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	r, host, binding := newManualProbeRuntime(t, now, func(cfg *Config) {
+		cfg.ProbeSendTimezone = "UTC"
+		cfg.ProbeTriggerMinutes = []int{7 * 60}
+	})
+	// A confirmed window is exactly what the scheduled trigger re-arms; the
+	// manual path must go through the same arming and persist it.
+	window, ok := r.probeController.Window(binding.Instance, ProbeWindowFiveHour)
+	if !ok {
+		t.Fatal("five hour window missing")
+	}
+	window.State = ProbeConfirmed
+	r.probeController.SetWindow(binding.Instance, ProbeWindowFiveHour, window)
+	if err := r.persistProbeWindows(); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := r.RunManualProbePass(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ArmedInstances != 1 {
+		t.Fatalf("ArmedInstances = %d, want 1", result.ArmedInstances)
+	}
+	if posts, urls := probePOSTCount(host); posts != 1 {
+		t.Fatalf("probe POST count = %d, want 1; urls=%v", posts, urls)
+	}
+	persisted, err := r.runtimeStore.PersistentSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempt, ok := persisted.ProbeAttempts[binding.Instance]; ok {
+		t.Fatalf("manual pass left a durable probe claim behind: %#v", attempt)
+	}
+	if state := persisted.ProbeWindows[binding.Instance][ProbeWindowFiveHour].State; state != ProbeConfirmed {
+		t.Fatalf("persisted window state = %q, want Confirmed", state)
+	}
+	fields := probeEventFields(t, r, now, "probe.schedule_triggered")
+	if fields["manual"] != true || fields["armed_instances"] != 1 {
+		t.Fatalf("schedule_triggered fields = %#v", fields)
+	}
+}
+
+func TestManualProbeTriggerRejectsDisabledAndUnavailableRuntimes(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	r, host, _ := newManualProbeRuntime(t, now, func(cfg *Config) { cfg.EnableResetProbe = false })
+	if _, err := r.RunManualProbePass(context.Background()); !errors.Is(err, ErrProbeTriggerDisabled) {
+		t.Fatalf("disabled err = %v, want %v", err, ErrProbeTriggerDisabled)
+	}
+	if posts, urls := probePOSTCount(host); posts != 0 {
+		t.Fatalf("disabled probe POST count = %d, want 0; urls=%v", posts, urls)
+	}
+
+	var missing *QuotaRefresher
+	if _, err := missing.RunManualProbePass(context.Background()); !errors.Is(err, ErrProbeTriggerUnavailable) {
+		t.Fatalf("nil runtime err = %v, want %v", err, ErrProbeTriggerUnavailable)
+	}
+	bare := &QuotaRefresher{state: NewPluginState(DefaultConfig())}
+	if _, err := bare.RunManualProbePass(context.Background()); !errors.Is(err, ErrProbeTriggerUnavailable) {
+		t.Fatalf("unwired runtime err = %v, want %v", err, ErrProbeTriggerUnavailable)
+	}
+}
+
+func TestManualProbeTriggerRejectsConcurrentDuplicate(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	r, host, _ := newManualProbeRuntime(t, now, func(cfg *Config) {
+		cfg.ProbeSendTimezone = "UTC"
+		cfg.ProbeTriggerMinutes = []int{7 * 60}
+	})
+	host.mu.Lock()
+	host.doStarted = make(chan struct{})
+	host.releaseDo = make(chan struct{})
+	started, release := host.doStarted, host.releaseDo
+	host.mu.Unlock()
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := r.RunManualProbePass(context.Background())
+		first <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("manual activation POST did not start")
+	}
+	if _, err := r.RunManualProbePass(context.Background()); !errors.Is(err, ErrProbeTriggerInFlight) {
+		t.Fatalf("duplicate err = %v, want %v", err, ErrProbeTriggerInFlight)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if posts, urls := probePOSTCount(host); posts != 1 {
+		t.Fatalf("probe POST count = %d, want exactly one activation; urls=%v", posts, urls)
+	}
+	// The latch is released once the pass finishes, so a later trigger works.
+	if _, err := r.RunManualProbePass(context.Background()); err != nil {
+		t.Fatalf("post-completion trigger err = %v", err)
+	}
+}
+
+// TestManualProbeTriggerReportsConflictWhenAnotherPassOwnsTheProbe pins the
+// contract that an operator trigger never answers "accepted" for work it did
+// not perform: the manual gate bypass only exists while RunManualProbePass owns
+// the pass, so a call that cannot take the probe lock must surface the conflict
+// instead of leaving the rerun to run under the scheduled gate.
+func TestManualProbeTriggerReportsConflictWhenAnotherPassOwnsTheProbe(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	r, host, _ := newManualProbeRuntime(t, now, func(cfg *Config) {
+		cfg.ProbeSendTimezone = "UTC"
+		cfg.ProbeSendWindows = mustWindows(t, "02:00-04:00")
+		cfg.ProbeTriggerMinutes = []int{7 * 60}
+	})
+	// Stand in for a scheduled/recovery pass that already owns the probe.
+	r.probeRunMu.Lock()
+	defer r.probeRunMu.Unlock()
+
+	result, err := r.RunManualProbePass(context.Background())
+	if !errors.Is(err, ErrProbeTriggerInFlight) {
+		t.Fatalf("err = %v, want %v", err, ErrProbeTriggerInFlight)
+	}
+	if result.Owned {
+		t.Fatalf("result = %#v, want Owned=false", result)
+	}
+	if status, descriptor := probeTriggerFailureStatus(err); status != http.StatusConflict || descriptor.Code != "probe_trigger_in_flight" || descriptor.Status != 0 {
+		t.Fatalf("status/descriptor = %d/%#v, want 409/probe_trigger_in_flight with no upstream status", status, descriptor)
+	}
+	if posts, urls := probePOSTCount(host); posts != 0 {
+		t.Fatalf("probe POST count = %d, want 0 while another pass owns the probe; urls=%v", posts, urls)
+	}
+	// The arming is still durable and the existing owner still services it, so
+	// the rejected trigger loses no work and queues no second activation round.
+	r.probeRunStateMu.Lock()
+	rerun := r.probeRerunPending
+	depth := r.probeManualDepth
+	r.probeRunStateMu.Unlock()
+	if !rerun {
+		t.Fatal("rerun was not handed to the running owner")
+	}
+	if depth != 0 {
+		t.Fatalf("probeManualDepth = %d, want 0 after the rejected trigger", depth)
+	}
+	if _, err := r.RunManualProbePass(context.Background()); !errors.Is(err, ErrProbeTriggerInFlight) {
+		t.Fatalf("second trigger err = %v, want %v", err, ErrProbeTriggerInFlight)
+	}
+	if posts, urls := probePOSTCount(host); posts != 0 {
+		t.Fatalf("probe POST count after retry = %d, want 0; urls=%v", posts, urls)
+	}
+}
+
+// TestProbeFailureAfterSendQuotesTheGateThatAuthorizedTheSend covers the log
+// consistency boundary: a pass that clears the gate, sends, and only then fails
+// after the send window has closed must still report the decision that let the
+// request out. A re-evaluated gate would print sent=true next to
+// send_allowed=false and read as an unauthorized send.
+func TestProbeFailureAfterSendQuotesTheGateThatAuthorizedTheSend(t *testing.T) {
+	start := time.Date(2026, 8, 29, 3, 59, 0, 0, time.UTC)
+	r, host, _ := newManualProbeRuntime(t, start, func(cfg *Config) {
+		cfg.ProbeSendTimezone = "UTC"
+		cfg.ProbeSendWindows = mustWindows(t, "02:00-04:00")
+		cfg.ProbeTriggerMinutes = []int{7 * 60}
+	})
+	var clockMu sync.Mutex
+	current := start
+	r.now = func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return current
+	}
+	// The activation POST leaves inside the send window; the clock then crosses
+	// the window boundary before the verify read fails.
+	host.mu.Lock()
+	host.doErrors = map[string][]error{r.state.Config().QuotaEndpoint: nil}
+	host.afterDo = func(req pluginapi.HTTPRequest) {
+		if req.URL != codexResetProbeEndpoint {
+			return
+		}
+		clockMu.Lock()
+		current = start.Add(31 * time.Minute) // 04:30 UTC, outside 02:00-04:00
+		clockMu.Unlock()
+		host.mu.Lock()
+		host.doErrors[r.state.Config().QuotaEndpoint] = []error{errors.New("verify read failed")}
+		host.mu.Unlock()
+	}
+	host.mu.Unlock()
+
+	result, err := r.RunManualProbePass(context.Background())
+	if err == nil {
+		t.Fatal("want the post-send verify read to fail")
+	}
+	if !result.Owned || !result.SendAllowed {
+		t.Fatalf("result = %#v, want an owned pass that was allowed to send", result)
+	}
+	if posts, urls := probePOSTCount(host); posts != 1 {
+		t.Fatalf("probe POST count = %d, want 1; urls=%v", posts, urls)
+	}
+	sent := probeEventFields(t, r, r.now(), "probe.activation_sent")
+	if sent["sent"] != true || sent["send_allowed"] != true {
+		t.Fatalf("activation_sent fields = %#v", sent)
+	}
+	failed := probeEventFields(t, r, r.now(), "probe.failed")
+	if failed["sent"] != true {
+		t.Fatalf("probe.failed must report the send that already happened: %#v", failed)
+	}
+	if failed["send_allowed"] != true || failed["send_window_allowed"] != true {
+		t.Fatalf("probe.failed must quote the gate that authorized the send, got %#v", failed)
+	}
+	if failed["manual_bypassed_trigger_gate"] != sent["manual_bypassed_trigger_gate"] {
+		t.Fatalf("post-send bypass field drifted: sent=%#v failed=%#v", sent, failed)
+	}
+}
+
+// TestScheduledProbePassNeverInheritsInFlightManualTrigger pins the ownership
+// boundary of the manual flag. An operator trigger relaxes probe_trigger_times
+// only for the pass RunManualProbePass itself owns. While such a trigger is in
+// flight but owns nothing here - it was rejected as a duplicate, or is still
+// waiting on the probe lock - a pass belonging to the scheduler must keep
+// running under the scheduled gate. Deriving the flag from shared state instead
+// of the owning call would let this pass send an activation POST hours outside
+// the configured trigger times while the operator was told 409.
+func TestScheduledProbePassNeverInheritsInFlightManualTrigger(t *testing.T) {
+	// 03:00 UTC is inside the send window but is not a configured trigger time,
+	// so only a genuinely manual pass may send here.
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	r, host, binding := newManualProbeRuntime(t, now, func(cfg *Config) {
+		cfg.ProbeSendTimezone = "UTC"
+		cfg.ProbeSendWindows = mustWindows(t, "02:00-04:00")
+		cfg.ProbeTriggerMinutes = []int{7 * 60}
+	})
+	// An operator trigger is in flight - it holds the dedupe latch - but it owns
+	// no pass: this one belongs to the scheduler.
+	if !r.beginManualProbe() {
+		t.Fatal("manual trigger latch was already held")
+	}
+	defer r.endManualProbe()
+
+	if err := r.RunProbeDueOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if posts, urls := probePOSTCount(host); posts != 0 {
+		t.Fatalf("scheduled pass sent %d activation POSTs outside the trigger times; urls=%v", posts, urls)
+	}
+	window, ok := r.probeController.Window(binding.Instance, ProbeWindowFiveHour)
+	if !ok || window.State != ProbeRetryWait {
+		t.Fatalf("window = %#v, ok=%v, want RetryWait", window, ok)
+	}
+	fields := probeEventFields(t, r, now, "probe.send_deferred")
+	if fields["manual"] != false || fields["manual_bypassed_trigger_gate"] != false {
+		t.Fatalf("scheduled pass claimed an operator trigger it does not own: %#v", fields)
+	}
+	if fields["trigger_allowed"] != false || fields["send_allowed"] != false {
+		t.Fatalf("send_deferred gate fields = %#v, want the trigger gate to veto the pass", fields)
+	}
+	if fields["send_window_allowed"] != true {
+		t.Fatalf("send window should still have been open: %#v", fields)
+	}
+}
+
+// TestProbeRecoveryPassNeverInheritsInFlightManualTrigger is the same ownership
+// boundary for the recovery path. Recovery resumes an activation an earlier
+// pass authorized and issues none of its own, so its logs must describe that
+// earlier decision. Borrowing a concurrent operator trigger's flag would stamp
+// manual_bypassed_trigger_gate onto a send no operator ever asked for.
+func TestProbeRecoveryPassNeverInheritsInFlightManualTrigger(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	r, host, binding := newManualProbeRuntime(t, now, func(cfg *Config) {
+		cfg.ProbeSendTimezone = "UTC"
+		cfg.ProbeSendWindows = mustWindows(t, "02:00-04:00")
+		cfg.ProbeTriggerMinutes = []int{7 * 60}
+	})
+	active := []byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_at":%q}}}`, now.Add(5*time.Hour).Format(time.RFC3339)))
+	host.mu.Lock()
+	host.quota = [][]byte{active}
+	host.mu.Unlock()
+
+	sendFence, err := r.probeFence.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := ProbeAttempt{Instance: binding.Instance, AttemptID: "manual-recovery", Windows: []ProbeWindowKind{ProbeWindowFiveHour}, Phase: ProbeAttemptSentUnknown, SendFenceSeq: sendFence, CreatedAt: now.Add(-time.Minute), VerifyNotBefore: now, SuppressUntil: now.Add(10 * time.Minute)}
+	window, ok := r.probeController.Window(binding.Instance, ProbeWindowFiveHour)
+	if !ok {
+		t.Fatal("five hour window missing")
+	}
+	window.State = ProbeSentUnknown
+	window.AttemptID = attempt.AttemptID
+	r.probeController.SetWindow(binding.Instance, ProbeWindowFiveHour, window)
+	if err = r.persistProbeWindows(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = r.runtimeStore.Update(func(state *PersistentState) error {
+		state.ProbeAttempts[binding.Instance] = attempt
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !r.beginManualProbe() {
+		t.Fatal("manual trigger latch was already held")
+	}
+	defer r.endManualProbe()
+
+	if err = r.RunProbeRecoveryOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if posts, urls := probePOSTCount(host); posts != 0 {
+		t.Fatalf("recovery sent %d activation POSTs; it resumes a send it did not issue; urls=%v", posts, urls)
+	}
+	fields := probeEventFields(t, r, r.now(), "probe.verified")
+	if fields["recovery"] != true {
+		t.Fatalf("recovery = %#v, want true", fields["recovery"])
+	}
+	if fields["manual"] != false || fields["manual_bypassed_trigger_gate"] != false {
+		t.Fatalf("recovery pass claimed an operator trigger it does not own: %#v", fields)
 	}
 }

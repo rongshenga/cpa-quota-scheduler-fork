@@ -45,6 +45,7 @@ type ProbeEvent struct {
 	Kind                ProbeEventKind
 	Window              ProbeWindowKind
 	Now                 time.Time
+	SendStartedAt       time.Time
 	Snapshots           map[ProbeWindowKind]QuotaSnapshot
 	RefreshMode         RefreshMode
 	ObservationInterval time.Duration
@@ -176,6 +177,17 @@ func (c *ProbeController) Advance(i AuthInstanceID, e ProbeEvent) []Intent {
 				continue
 			}
 			baseline := w.Baseline
+			if e.Kind == ProbeEventVerifyResult && resetAnchoredAfterActivation(baseline, snap, e.SendStartedAt, e.Now) {
+				baseline.ResetAt = *snap.ResetAt
+				baseline.Usage = *snap.Usage
+				baseline.SuspectedLazy = false
+				w.Baseline = baseline
+				w.State = ProbeConfirmed
+				w.Deadline = time.Time{}
+				w.AttemptID = ""
+				ws[k] = w
+				continue
+			}
 			shiftedZeroCandidate := false
 			strictAuthorized := false
 			if e.Kind == ProbeEventPrecheckResult && baseline.Kind == ProbeBaselineReset && snap.Valid && snap.ResetAt != nil && snap.Usage != nil {

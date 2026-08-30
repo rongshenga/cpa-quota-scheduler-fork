@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -209,15 +211,34 @@ func getResetAt(m map[string]any, now time.Time) (time.Time, bool) {
 	if raw, ok := getAny(m, "reset_at", "resetAt"); ok {
 		switch v := raw.(type) {
 		case string:
-			if parsed, err := time.Parse(time.RFC3339, v); err == nil {
+			trimmed := strings.TrimSpace(v)
+			if parsed, err := time.Parse(time.RFC3339, trimmed); err == nil {
 				return parsed, true
 			}
+			if seconds, err := strconv.ParseFloat(trimmed, 64); err == nil {
+				return timeFromUnixSeconds(seconds)
+			}
+		case float64:
+			return timeFromUnixSeconds(v)
+		case int64:
+			return timeFromUnixSeconds(float64(v))
+		case int:
+			return timeFromUnixSeconds(float64(v))
 		}
 	}
 	if seconds, ok := getFloat64(m, "reset_after_seconds", "resetAfterSeconds"); ok {
 		return now.Add(time.Duration(seconds * float64(time.Second))), true
 	}
 	return time.Time{}, false
+}
+
+func timeFromUnixSeconds(seconds float64) (time.Time, bool) {
+	if seconds <= 0 {
+		return time.Time{}, false
+	}
+	whole := int64(seconds)
+	nanos := int64((seconds - float64(whole)) * float64(time.Second))
+	return time.Unix(whole, nanos).UTC(), true
 }
 
 func getTime(m map[string]any, keys ...string) (time.Time, bool) {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,7 @@ func TestManagementRegisterExposesStatusResourceAndRoutes(t *testing.T) {
 		{http.MethodPost, "/refresh"},
 		{http.MethodPut, "/settings"},
 		{http.MethodPatch, "/annotations/account"},
+		{http.MethodPost, "/probe/trigger"},
 	} {
 		if resourceRouteAllowed(mutation.method, mutation.path) {
 			t.Fatalf("%s %s crossed the Resource boundary", mutation.method, mutation.path)
@@ -62,6 +64,7 @@ func TestManagementRegisterExposesStatusResourceAndRoutes(t *testing.T) {
 		"PUT /plugins/codex-quota-scheduler/settings",
 		"POST /plugins/codex-quota-scheduler/refresh",
 		"POST /plugins/codex-quota-scheduler/refresh/account",
+		"POST /plugins/codex-quota-scheduler/probe/trigger",
 		"GET /plugins/codex-quota-scheduler/logs",
 		"GET /plugins/codex-quota-scheduler/export",
 		"POST /plugins/codex-quota-scheduler/import",
@@ -1872,13 +1875,17 @@ func TestManagementLogsExposeProbeLifecycleWithoutSensitiveValues(t *testing.T) 
 	if err := json.Unmarshal(resp.Body, &body); err != nil {
 		t.Fatalf("json.Unmarshal returned error: %v; body=%s", err, resp.Body)
 	}
-	if len(body.Logs) != 2 {
-		t.Fatalf("logs = %#v, want precheck and terminal failure entries", body.Logs)
-	}
-	for i, want := range []struct{ event, message string }{
+	// The precheck read fails, so the pass never reaches probe.precheck_result,
+	// probe.activation_sent or probe.verified; it stops at the terminal failure.
+	wantLifecycle := []struct{ event, message string }{
+		{"probe.sequence_started", "开始执行额度周期探测流程"},
 		{"probe.precheck_started", "开始检查疑似未激活的额度周期"},
 		{"probe.failed", "额度周期探测失败，已按安全策略处理"},
-	} {
+	}
+	if len(body.Logs) != len(wantLifecycle) {
+		t.Fatalf("logs = %#v, want sequence start, precheck and terminal failure entries", body.Logs)
+	}
+	for i, want := range wantLifecycle {
 		if body.Logs[i].Event != want.event || body.Logs[i].Message != want.message {
 			t.Fatalf("log %d = %#v, want visible event/message %#v", i, body.Logs[i], want)
 		}
@@ -2018,5 +2025,359 @@ func TestAnnotationsPersistenceFailureDoesNotMutateMemory(t *testing.T) {
 			}
 			tt.check(t, state)
 		})
+	}
+}
+
+// probeTriggerLifecycle builds a lifecycle snapshot whose TriggerProbe returns
+// a canned outcome, so the management layer can be exercised without a live
+// probe runtime. calls counts how often the route reached the runtime.
+func probeTriggerLifecycle(result ManualProbeTriggerResult, err error, calls *int) ManagementLifecycleSnapshot {
+	return ManagementLifecycleSnapshot{
+		Roster: ActiveRoster{Capability: CapabilityA, Confirmed: true, Health: RosterHealthy, BackgroundAllowed: true},
+		TriggerProbe: func(context.Context) (ManualProbeTriggerResult, error) {
+			if calls != nil {
+				*calls++
+			}
+			return result, err
+		},
+	}
+}
+
+func TestManagementProbeTriggerAcceptsOperatorPass(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	calls := 0
+	lifecycle := probeTriggerLifecycle(ManualProbeTriggerResult{
+		Manual:              true,
+		Owned:               true,
+		TriggeredAt:         now,
+		ArmedInstances:      2,
+		SendAllowed:         true,
+		TriggerAllowed:      false,
+		SendWindowAllowed:   true,
+		BypassedTriggerGate: true,
+		GatePolicy:          probeGatePolicy,
+		SendWindows:         "02:00-04:00",
+		TriggerTimes:        "07:00",
+	}, nil, &calls)
+
+	resp := HandleManagementRequestWithLifecycle(store, pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/codex-quota-scheduler/probe/trigger",
+	}, now, lifecycle)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusAccepted, resp.Body)
+	}
+	if calls != 1 {
+		t.Fatalf("TriggerProbe calls = %d, want 1", calls)
+	}
+	var body struct {
+		OK      bool                     `json:"ok"`
+		Trigger ManualProbeTriggerResult `json:"trigger"`
+	}
+	if err := json.Unmarshal(resp.Body, &body); err != nil {
+		t.Fatalf("json.Unmarshal returned error: %v; body=%s", err, resp.Body)
+	}
+	if !body.OK || !body.Trigger.Manual || !body.Trigger.Owned || body.Trigger.ArmedInstances != 2 {
+		t.Fatalf("trigger payload = %#v", body.Trigger)
+	}
+	if !body.Trigger.BypassedTriggerGate || !body.Trigger.SendWindowAllowed || body.Trigger.GatePolicy != probeGatePolicy {
+		t.Fatalf("gate payload = %#v, want the trigger-time bypass recorded with the send window still honoured", body.Trigger)
+	}
+	logs := store.Snapshot(now).Logs
+	if len(logs) != 1 || logs[0].Event != "ui.probe_trigger_requested" {
+		t.Fatalf("logs = %#v, want a single request log", logs)
+	}
+}
+
+func TestManagementProbeTriggerRejectsDisabledDuplicateAndUnavailable(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{"disabled", ErrProbeTriggerDisabled, http.StatusConflict, "reset_probe_disabled"},
+		{"duplicate", ErrProbeTriggerInFlight, http.StatusConflict, "probe_trigger_in_flight"},
+		{"unavailable", ErrProbeTriggerUnavailable, http.StatusServiceUnavailable, "probe_runtime_unavailable"},
+		{"not authorized", ErrCapabilityB, http.StatusServiceUnavailable, "background_not_authorized"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewPluginState(DefaultConfig())
+			lifecycle := probeTriggerLifecycle(ManualProbeTriggerResult{Manual: true}, tc.err, nil)
+			resp := HandleManagementRequestWithLifecycle(store, pluginapi.ManagementRequest{
+				Method: http.MethodPost,
+				Path:   "/v0/management/plugins/codex-quota-scheduler/probe/trigger",
+			}, now, lifecycle)
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, resp.Body)
+			}
+			var body struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(resp.Body, &body); err != nil {
+				t.Fatalf("json.Unmarshal returned error: %v; body=%s", err, resp.Body)
+			}
+			if body.Error != tc.wantCode {
+				t.Fatalf("error = %q, want %q", body.Error, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestManagementProbeTriggerReportsUnavailableWithoutRuntime(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	// No lifecycle at all, and a lifecycle whose runtime was never wired up,
+	// must both answer 503 rather than pretending the pass was queued.
+	for _, resp := range []pluginapi.ManagementResponse{
+		HandleManagementRequest(store, pluginapi.ManagementRequest{
+			Method: http.MethodPost,
+			Path:   "/v0/management/plugins/codex-quota-scheduler/probe/trigger",
+		}, now),
+		HandleManagementRequestWithLifecycle(store, pluginapi.ManagementRequest{
+			Method: http.MethodPost,
+			Path:   "/v0/management/plugins/codex-quota-scheduler/probe/trigger",
+		}, now, ManagementLifecycleSnapshot{Roster: ActiveRoster{Capability: CapabilityB, Health: RosterWaiting}}),
+	} {
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusServiceUnavailable, resp.Body)
+		}
+	}
+	if logs := store.Snapshot(now).Logs; len(logs) != 0 {
+		t.Fatalf("logs = %#v, want no request log for an unreachable runtime", logs)
+	}
+}
+
+func TestManagementProbeTriggerIsNotReachableFromResourceBoundary(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	calls := 0
+	lifecycle := probeTriggerLifecycle(ManualProbeTriggerResult{Manual: true, Owned: true}, nil, &calls)
+
+	for _, method := range []string{http.MethodPost, http.MethodGet} {
+		resp := HandleManagementRequestWithLifecycle(store, pluginapi.ManagementRequest{
+			Method: method,
+			Path:   "/v0/resource/plugins/codex-quota-scheduler/probe/trigger",
+		}, now, lifecycle)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s resource probe/trigger StatusCode = %d, want %d; body=%s", method, resp.StatusCode, http.StatusNotFound, resp.Body)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("TriggerProbe calls = %d, want 0 across the Resource boundary", calls)
+	}
+	if logs := store.Snapshot(now).Logs; len(logs) != 0 {
+		t.Fatalf("logs = %#v, want no probe trigger log from a Resource request", logs)
+	}
+}
+
+func TestManagementProbeTriggerFailureNeverEchoesUpstreamText(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	sentinel := "upstream-body-sentinel-401928"
+	lifecycle := probeTriggerLifecycle(ManualProbeTriggerResult{Manual: true}, quotaStatusError{status: http.StatusTooManyRequests, body: []byte(sentinel)}, nil)
+
+	resp := HandleManagementRequestWithLifecycle(store, pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/codex-quota-scheduler/probe/trigger",
+	}, now, lifecycle)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusInternalServerError, resp.Body)
+	}
+	if strings.Contains(string(resp.Body), sentinel) {
+		t.Fatalf("probe trigger response leaked upstream text: %s", resp.Body)
+	}
+	for _, entry := range store.Snapshot(now).Logs {
+		for _, value := range entry.Fields {
+			if text, ok := value.(string); ok && strings.Contains(text, sentinel) {
+				t.Fatalf("probe trigger log leaked upstream text: %#v", entry)
+			}
+		}
+	}
+}
+
+// TestManagementProbeTriggerReportsUpstreamStatusAndSafeCode covers the answer
+// an operator gets when the activation itself is what failed. The route's own
+// status says "the pass did not finish"; only the enumerated code and the
+// upstream status say why. Without them a retired activation endpoint reads as
+// a bare 500 with nothing to act on, which is exactly how the /compact 404
+// stayed invisible.
+func TestManagementProbeTriggerReportsUpstreamStatusAndSafeCode(t *testing.T) {
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	sentinel := "upstream-body-sentinel-118422"
+	for _, tc := range []struct {
+		name         string
+		err          error
+		wantCode     string
+		wantCategory string
+		wantUpstream float64
+	}{
+		{
+			name:         "retired activation endpoint",
+			err:          quotaStatusError{status: http.StatusNotFound, body: []byte(sentinel)},
+			wantCode:     "quota_http_status",
+			wantCategory: "upstream_http",
+			wantUpstream: float64(http.StatusNotFound),
+		},
+		{
+			name:         "rate limited",
+			err:          quotaStatusError{status: http.StatusTooManyRequests, body: []byte(sentinel)},
+			wantCode:     "quota_http_status",
+			wantCategory: "upstream_http",
+			wantUpstream: float64(http.StatusTooManyRequests),
+		},
+		{
+			name:         "rejected under a success status",
+			err:          probeActivationError{Code: probeActivationUsageLimitCode, Status: http.StatusOK},
+			wantCode:     probeActivationUsageLimitCode,
+			wantCategory: "upstream_business",
+			wantUpstream: float64(http.StatusOK),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewPluginState(DefaultConfig())
+			lifecycle := probeTriggerLifecycle(ManualProbeTriggerResult{Manual: true, Owned: true}, tc.err, nil)
+			resp := HandleManagementRequestWithLifecycle(store, pluginapi.ManagementRequest{
+				Method: http.MethodPost,
+				Path:   "/v0/management/plugins/codex-quota-scheduler/probe/trigger",
+			}, now, lifecycle)
+			if resp.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusInternalServerError, resp.Body)
+			}
+			var body struct {
+				Error          string  `json:"error"`
+				ErrorCategory  string  `json:"error_category"`
+				UpstreamStatus float64 `json:"upstream_status"`
+			}
+			if err := json.Unmarshal(resp.Body, &body); err != nil {
+				t.Fatalf("json.Unmarshal returned error: %v; body=%s", err, resp.Body)
+			}
+			if body.Error != tc.wantCode || body.ErrorCategory != tc.wantCategory {
+				t.Fatalf("error/category = %q/%q, want %q/%q", body.Error, body.ErrorCategory, tc.wantCode, tc.wantCategory)
+			}
+			if body.UpstreamStatus != tc.wantUpstream {
+				t.Fatalf("upstream_status = %v, want %v", body.UpstreamStatus, tc.wantUpstream)
+			}
+			if strings.Contains(string(resp.Body), sentinel) {
+				t.Fatalf("probe trigger response leaked upstream text: %s", resp.Body)
+			}
+			logs := store.Snapshot(now).Logs
+			rejected := logs[len(logs)-1]
+			if rejected.Event != "ui.probe_trigger_rejected" {
+				t.Fatalf("last log = %#v, want ui.probe_trigger_rejected", rejected)
+			}
+			if rejected.Fields["error"] != tc.wantCode || rejected.Fields["upstream_status"] != int(tc.wantUpstream) {
+				t.Fatalf("rejection log fields = %#v", rejected.Fields)
+			}
+			for _, entry := range logs {
+				for _, value := range entry.Fields {
+					if text, ok := value.(string); ok && strings.Contains(text, sentinel) {
+						t.Fatalf("probe trigger log leaked upstream text: %#v", entry)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestManagementPageNamesActivationFailures keeps the browser able to explain a
+// failed activation. The page must carry a message for every enumerated code the
+// route can now answer with, plus the upstream status that tells the two
+// "the upstream said no" cases apart.
+func TestManagementPageNamesActivationFailures(t *testing.T) {
+	store := NewPluginState(DefaultConfig())
+	resp := HandleManagementRequest(store, pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/resource/plugins/codex-quota-scheduler/status",
+	}, time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, resp.Body)
+	}
+	page := string(resp.Body)
+
+	for _, key := range []string{
+		"error.quota_http_status",
+		"error.activation_rejected",
+		"error.activation_usage_limit",
+		"error.probe_operation_failed",
+		"error.upstreamStatus",
+	} {
+		if got := strings.Count(page, "'"+key+"'"); got < 2 {
+			t.Fatalf("activation failure key %q appears %d times, want a zh-CN and an en string", key, got)
+		}
+	}
+	for _, want := range []string{
+		"failure.upstreamStatus=data.upstream_status",         // the status survives onto the error
+		"error.upstreamStatus',{status:error.upstreamStatus}", // and is rendered next to the code
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("management page is missing activation failure wiring %q", want)
+		}
+	}
+	// The upstream status is a number the page prints; it must never be joined
+	// with anything the upstream wrote.
+	if strings.Contains(page, "data.upstream_body") || strings.Contains(page, "error.upstreamBody") {
+		t.Fatal("management page renders an upstream body")
+	}
+}
+
+// TestManagementPageProbeButtonCallsTheTriggerRoute pins the browser half of
+// the manual trigger. The button is the only way an operator reaches
+// /probe/trigger, so the page must actually issue the POST and must be able to
+// name every answer the route can give: 202, the two 409 conflicts, 503, and
+// the 404 an older plugin build returns for a route it never registered.
+func TestManagementPageProbeButtonCallsTheTriggerRoute(t *testing.T) {
+	store := NewPluginState(DefaultConfig())
+	resp := HandleManagementRequest(store, pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/resource/plugins/codex-quota-scheduler/status",
+	}, time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, resp.Body)
+	}
+	page := string(resp.Body)
+
+	for _, want := range []string{
+		`id="probeNow"`,                                     // the button exists
+		`document.getElementById('probeNow')`,               // and is wired to a handler
+		`triggerProbeNow`,                                   // which is the trigger call
+		`requestManagement('/probe/trigger',{method:'POST'`, // that really POSTs the route
+		`failure.status=resp.status`,                        // status survives onto the error
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("management page is missing probe trigger wiring %q", want)
+		}
+	}
+
+	// Every status the route can answer must map to a message, in both locales.
+	for _, key := range []string{
+		"notice.probeTriggered",           // 202
+		"error.probe_trigger_in_flight",   // 409
+		"error.reset_probe_disabled",      // 409
+		"error.probe_runtime_unavailable", // 503
+		"error.background_not_authorized", // 503
+		"error.probeUnavailable",          // 404 from a build without the route
+	} {
+		if got := strings.Count(page, "'"+key+"'"); got < 2 {
+			t.Fatalf("probe trigger key %q appears %d times, want a zh-CN and an en string", key, got)
+		}
+	}
+	for _, label := range []string{"立即探测 5h", "Probe 5h Now"} {
+		if !strings.Contains(page, label) {
+			t.Fatalf("management page lost the %q button label", label)
+		}
+	}
+
+	// The management key is a bearer credential typed into the page; only the
+	// chosen locale may outlive the tab.
+	for _, call := range regexp.MustCompile(`\.(?:setItem|getItem)\([^,)]*`).FindAllString(page, -1) {
+		if !strings.Contains(call, "LOCALE_STORAGE_KEY") {
+			t.Fatalf("management page persists something other than the locale: %q", call)
+		}
+	}
+	if regexp.MustCompile(`(?:setItem|getItem|document\.cookie)[^\n]{0,80}managementKey`).MatchString(page) {
+		t.Fatal("management page persists the CPA management key")
 	}
 }

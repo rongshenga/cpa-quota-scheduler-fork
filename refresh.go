@@ -245,6 +245,7 @@ type QuotaRefresher struct {
 	probeRetryGeneration   uint64
 	probeRecoveryPending   bool
 	probeOwnerRetryPending bool
+	probeManualDepth       int
 	probeScheduleMu        sync.Mutex
 	probeScheduleKey       string
 	probeNextTrigger       time.Time
@@ -1197,7 +1198,16 @@ func (r *QuotaRefresher) Start() {
 	r.mu.Lock()
 	r.startRequested = true
 	r.mu.Unlock()
-	if !r.normalBackgroundAllowed() && !r.probeBackgroundAllowed() && !(r.resetProbeEnabled() && r.provisionalProbeRiskConfigured()) {
+	// Keep the clock alive for an explicitly configured probe schedule even
+	// while the authoritative roster is still being established. Previously
+	// Start returned here when the roster was CapabilityB; if that happened to
+	// span a wall-clock slot, the first successful roster publication
+	// initialized the schedule to the next slot and the missed slot was lost.
+	// The timer only arms durable pending windows in this state; the probe pass
+	// still enforces roster authorization before any upstream request is sent.
+	minutes, _, _ := r.probeScheduleConfig()
+	scheduledProbeClock := r.resetProbeEnabled() && len(minutes) > 0
+	if !r.normalBackgroundAllowed() && !r.probeBackgroundAllowed() && !(r.resetProbeEnabled() && r.provisionalProbeRiskConfigured()) && !scheduledProbeClock {
 		return
 	}
 	r.mu.Lock()
@@ -1245,11 +1255,18 @@ func (r *QuotaRefresher) Start() {
 				r.RefreshDueSoon()
 				if r.probeController != nil {
 					if r.consumeProbeSchedule(now) {
-						if err := r.armScheduledFiveHourChecks(); err != nil && r.state != nil {
+						armed, err := r.armScheduledFiveHourChecks()
+						r.recordProbeScheduleTriggered(now, r.evaluateProbeSendGate(now, false), armed, err)
+						if err != nil && r.state != nil {
 							r.state.RecordLog("warn", "probe.schedule_arm_failed", "定时额度探测排程持久化失败", map[string]any{"error": err.Error()}, now)
 						}
 					}
-					r.launchProbeFromTimer(false)
+					// Keep pending windows durable while the roster is waiting;
+					// ObserveRosterLifecycle starts the pass once authorization is
+					// available, without sending upstream traffic prematurely.
+					if r.probeBackgroundAllowed() {
+						r.launchProbeFromTimer(false)
+					}
 				}
 			case <-wake:
 				if timer != nil && !timer.Stop() {
@@ -1768,7 +1785,7 @@ func (r *QuotaRefresher) refreshAuthVersionedHeld(auth pluginapi.HostAuthFileEnt
 	account.LastError = ""
 	account.LastSuccessAt = r.now()
 	if r.state.ApplyQuotaRefreshSuccessIfAdmissionCurrent(account, version, r.now()) {
-		globalTrials.ObserveEvidence(account.Instance, Evidence{Kind: EvidenceReliableQuotaWriteback, At: r.now()})
+		globalTrials().ObserveEvidence(account.Instance, Evidence{Kind: EvidenceReliableQuotaWriteback, At: r.now()})
 		publishSchedulerState(r.state, highestTierSet(r.runtimeRoster()), r.now())
 		r.recordAdmissionLog(account.AuthID, version, "info", "quota.refresh_success", "账号额度刷新成功", map[string]any{"auth_id": account.AuthID})
 	}
@@ -1841,37 +1858,23 @@ func (r *QuotaRefresher) doBackgroundHTTPRequest(req pluginapi.HTTPRequest, prob
 		_ = owner.persistProbeRosterHold()
 		return pluginapi.HTTPResponse{}, ErrCapabilityB
 	}
+	// rosterMu, and state.mu whenever the decision reads configuration, stay
+	// held across host.Do on purpose: they are the linearization fence for an
+	// authorized background request, not incidental critical sections. A
+	// request that has already passed the gate must finish - or be observed as
+	// in flight - before a roster publication or a config change can claim it
+	// never had permission to start. Sampling the gate inputs and releasing the
+	// locks before the call would let ObserveRosterLifecycle publish FailClosed,
+	// or ReplaceConfig disable provisional probing, while the POST it forbids is
+	// on the wire, so the two would disagree about whether it was ever allowed.
 	defer owner.rosterMu.RUnlock()
-	if owner.state == nil && probe {
-		return pluginapi.HTTPResponse{}, ErrCapabilityB
-	}
 	if owner.state != nil && (probe || roster.Provisional) {
 		owner.state.mu.RLock()
 		defer owner.state.mu.RUnlock()
-		if probe && !owner.state.cfg.EnableResetProbe {
-			return pluginapi.HTTPResponse{}, ErrCapabilityB
-		}
 	}
-	allowed := normalRosterBackgroundAllowed(roster)
-	if probe {
-		allowed = allowed || provisionalProbeBackgroundAllowed(roster)
-	}
-	if roster.Provisional {
-		if owner.state == nil {
-			return pluginapi.HTTPResponse{}, ErrCapabilityB
-		}
-		if !owner.state.cfg.ProbeOnProvisionalRoster || !provisionalAgeValid(owner.now(), roster.ConfirmedAt) {
-			allowed = false
-		}
-	}
-	if !allowed {
-		return pluginapi.HTTPResponse{}, ErrCapabilityB
-	}
-	marker := ""
-	if roster.Health == RosterDegraded {
-		marker = rosterLifecycleDegraded
-	} else if probe && roster.Provisional {
-		marker = rosterLifecycleProvisional
+	marker, err := owner.backgroundRequestGateLocked(roster, probe)
+	if err != nil {
+		return pluginapi.HTTPResponse{}, err
 	}
 	if marker != "" {
 		if req.Headers == nil {
@@ -1880,6 +1883,42 @@ func (r *QuotaRefresher) doBackgroundHTTPRequest(req pluginapi.HTTPRequest, prob
 		req.Headers.Set(rosterLifecycleRequestHeader, marker)
 	}
 	return r.host.Do(req)
+}
+
+// backgroundRequestGateLocked decides whether a background request may leave
+// the process, and which roster-lifecycle marker it carries. A nil error means
+// the request is authorized; the marker may still be empty.
+//
+// The caller holds rosterMu for reading, plus state.mu for reading whenever the
+// decision depends on configuration (a probe, or a provisional roster). Both
+// remain held through host.Do; see doBackgroundHTTPRequest for why. Nothing
+// here may acquire either lock or block on I/O.
+func (r *QuotaRefresher) backgroundRequestGateLocked(roster HostRosterSnapshot, probe bool) (string, error) {
+	if probe && (r.state == nil || !r.state.cfg.EnableResetProbe) {
+		return "", ErrCapabilityB
+	}
+	allowed := normalRosterBackgroundAllowed(roster)
+	if probe {
+		allowed = allowed || provisionalProbeBackgroundAllowed(roster)
+	}
+	if roster.Provisional {
+		if r.state == nil {
+			return "", ErrCapabilityB
+		}
+		if !r.state.cfg.ProbeOnProvisionalRoster || !provisionalAgeValid(r.now(), roster.ConfirmedAt) {
+			allowed = false
+		}
+	}
+	if !allowed {
+		return "", ErrCapabilityB
+	}
+	if roster.Health == RosterDegraded {
+		return rosterLifecycleDegraded, nil
+	}
+	if probe && roster.Provisional {
+		return rosterLifecycleProvisional, nil
+	}
+	return "", nil
 }
 
 func (r *QuotaRefresher) saveAuthWithAdmissionPermit(authID string, version uint64, name string, raw json.RawMessage) error {
@@ -2135,7 +2174,7 @@ func (r *QuotaRefresher) upsertRefreshFailure(account AccountState, version uint
 	merged.LastRefreshAt = account.LastRefreshAt
 	merged.LastError = message
 	if r.state.ApplyQuotaRefreshFailureIfAdmissionCurrent(merged, version, kind, message, r.now()) {
-		globalTrials.ObserveRetry(merged.Instance, r.now())
+		globalTrials().ObserveRetry(merged.Instance, r.now())
 		publishSchedulerState(r.state, highestTierSet(r.runtimeRoster()), r.now())
 		r.recordAdmissionLog(merged.AuthID, version, "warn", "quota.refresh_failed", "账号额度刷新失败", map[string]any{"auth_id": merged.AuthID, "error": message})
 	}
