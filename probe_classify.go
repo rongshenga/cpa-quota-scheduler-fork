@@ -15,17 +15,34 @@ const (
 // from a lazy projection. A lazy reset moves forward with the observation
 // clock; an activated reset remains fixed. This narrow, send-scoped check must
 // not reuse the broad clock-skew tolerance used for observations across hosts.
-func resetAnchoredAfterActivation(base ProbeBaseline, snap QuotaSnapshot, sendStartedAt, observedAt time.Time) bool {
-	if !base.SuspectedLazy || !snap.Valid || snap.ResetAt == nil || snap.Usage == nil || sendStartedAt.IsZero() || observedAt.IsZero() {
+func resetAnchoredAfterActivation(base ProbeBaseline, snap QuotaSnapshot, sendStartedAt, sendCompletedAt, observedAt time.Time) bool {
+	if !base.SuspectedLazy || !snap.Valid || snap.ResetAt == nil || snap.Usage == nil || sendStartedAt.IsZero() || sendCompletedAt.IsZero() || observedAt.IsZero() {
 		return false
 	}
-	if observedAt.Sub(sendStartedAt) < probeActivationVerifyDelay-probeAnchoredResetTolerance {
+	length := base.WindowLength
+	if length <= 0 && snap.WindowLengthKnown {
+		length = snap.WindowLength
+	}
+	if length <= 0 {
 		return false
 	}
-	if !base.ResetAt.After(observedAt) || !snap.ResetAt.After(observedAt) {
+	if sendCompletedAt.Before(sendStartedAt) || observedAt.Sub(sendCompletedAt) < probeActivationVerifyDelay-probeAnchoredResetTolerance {
 		return false
 	}
-	return absDuration(snap.ResetAt.Sub(base.ResetAt)) <= probeAnchoredResetTolerance
+	if !snap.ResetAt.After(observedAt) {
+		return false
+	}
+	// Upstream anchors the window while the activation request is in flight,
+	// not at the precheck that projected the lazy reset, so the fixed reset
+	// lands one window length after some instant between send start and send
+	// completion - a gap the old comparison against the precheck projection
+	// misread as "still lazy" whenever the request took more than the
+	// tolerance. A reset that still slides sits one window length after the
+	// verify read, which is probeActivationVerifyDelay past send completion
+	// and therefore outside this interval.
+	earliest := sendStartedAt.Add(length).Add(-probeAnchoredResetTolerance)
+	latest := sendCompletedAt.Add(length).Add(probeAnchoredResetTolerance)
+	return !snap.ResetAt.Before(earliest) && !snap.ResetAt.After(latest)
 }
 
 type ProbeBaselineKind string

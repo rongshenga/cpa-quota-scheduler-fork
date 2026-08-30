@@ -102,46 +102,55 @@ func TestProbeControllerUsageOnlyZeroWithoutResetDoesNotSend(t *testing.T) {
 }
 
 func TestProbeVerifyConfirmsFixedResetAfterFiveSeconds(t *testing.T) {
-	sentAt := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
-	resetAt := sentAt.Add(5 * time.Hour)
-	base := ResetProbeBaseline(resetAt, 0, 5*time.Hour)
+	sendStartedAt := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	// The activation request took four seconds, and upstream anchored the
+	// window on its completion - four seconds past the reset the precheck had
+	// projected, and twice the anchored-reset tolerance.
+	sendCompletedAt := sendStartedAt.Add(4 * time.Second)
+	projectedResetAt := sendStartedAt.Add(5 * time.Hour)
+	anchoredResetAt := sendCompletedAt.Add(5 * time.Hour)
+	base := ResetProbeBaseline(projectedResetAt, 0, 5*time.Hour)
 	base.WindowKind = WindowFiveHour
 	base.SuspectedLazy = true
-	c := NewProbeController(sentAt)
+	c := NewProbeController(sendStartedAt)
 	c.SetWindow(1, ProbeWindowFiveHour, ProbeWindow{State: ProbeSentAwaitingVerify, Baseline: base, AttemptID: "probe-1"})
 
 	c.Advance(1, ProbeEvent{
-		Kind:          ProbeEventVerifyResult,
-		Window:        ProbeWindowFiveHour,
-		Now:           sentAt.Add(probeActivationVerifyDelay),
-		SendStartedAt: sentAt,
+		Kind:            ProbeEventVerifyResult,
+		Window:          ProbeWindowFiveHour,
+		Now:             sendCompletedAt.Add(probeActivationVerifyDelay),
+		SendStartedAt:   sendStartedAt,
+		SendCompletedAt: sendCompletedAt,
 		Snapshots: map[ProbeWindowKind]QuotaSnapshot{
-			ProbeWindowFiveHour: {Valid: true, ResetAt: ptrTime(resetAt), Usage: ptrFloat(0), WindowKind: WindowFiveHour, WindowLength: 5 * time.Hour, WindowLengthKnown: true},
+			ProbeWindowFiveHour: {Valid: true, ResetAt: ptrTime(anchoredResetAt), Usage: ptrFloat(0), WindowKind: WindowFiveHour, WindowLength: 5 * time.Hour, WindowLengthKnown: true},
 		},
 	})
 
 	window, ok := c.Window(1, ProbeWindowFiveHour)
-	if !ok || window.State != ProbeConfirmed || window.Baseline.SuspectedLazy || !window.Deadline.IsZero() || window.AttemptID != "" {
+	if !ok || window.State != ProbeConfirmed || window.Baseline.SuspectedLazy || !window.Baseline.ResetAt.Equal(anchoredResetAt) || !window.Deadline.IsZero() || window.AttemptID != "" {
 		t.Fatalf("window = %#v, ok=%v; want fixed reset confirmed after one five-second read", window, ok)
 	}
 }
 
 func TestProbeVerifyDoesNotConfirmSlidingResetAfterFiveSeconds(t *testing.T) {
-	sentAt := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
-	resetAt := sentAt.Add(5 * time.Hour)
+	sendStartedAt := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	sendCompletedAt := sendStartedAt.Add(4 * time.Second)
+	resetAt := sendStartedAt.Add(5 * time.Hour)
 	base := ResetProbeBaseline(resetAt, 0, 5*time.Hour)
 	base.WindowKind = WindowFiveHour
 	base.SuspectedLazy = true
-	c := NewProbeController(sentAt)
+	c := NewProbeController(sendStartedAt)
 	c.SetWindow(1, ProbeWindowFiveHour, ProbeWindow{State: ProbeSentAwaitingVerify, Baseline: base, AttemptID: "probe-1"})
+	observedAt := sendCompletedAt.Add(probeActivationVerifyDelay)
 
 	c.Advance(1, ProbeEvent{
-		Kind:          ProbeEventVerifyResult,
-		Window:        ProbeWindowFiveHour,
-		Now:           sentAt.Add(probeActivationVerifyDelay),
-		SendStartedAt: sentAt,
+		Kind:            ProbeEventVerifyResult,
+		Window:          ProbeWindowFiveHour,
+		Now:             observedAt,
+		SendStartedAt:   sendStartedAt,
+		SendCompletedAt: sendCompletedAt,
 		Snapshots: map[ProbeWindowKind]QuotaSnapshot{
-			ProbeWindowFiveHour: {Valid: true, ResetAt: ptrTime(resetAt.Add(probeActivationVerifyDelay)), Usage: ptrFloat(0), WindowKind: WindowFiveHour, WindowLength: 5 * time.Hour, WindowLengthKnown: true},
+			ProbeWindowFiveHour: {Valid: true, ResetAt: ptrTime(observedAt.Add(5 * time.Hour)), Usage: ptrFloat(0), WindowKind: WindowFiveHour, WindowLength: 5 * time.Hour, WindowLengthKnown: true},
 		},
 	})
 

@@ -662,13 +662,13 @@ func (r *QuotaRefresher) persistTerminalProbeCompletion(instance AuthInstanceID,
 	return r.persistTerminalProbeCompletionLocked(instance, attemptID, quota, phases...)
 }
 
-func (r *QuotaRefresher) persistVerifiedProbeCompletion(instance AuthInstanceID, attemptID string, sendStartedAt time.Time, quota ParsedQuota, phases ...ProbeAttemptPhase) error {
+func (r *QuotaRefresher) persistVerifiedProbeCompletion(instance AuthInstanceID, attemptID string, sendStartedAt, sendCompletedAt time.Time, quota ParsedQuota, phases ...ProbeAttemptPhase) error {
 	if r.runtimeStore == nil || r.probeController == nil || instance == 0 {
 		return nil
 	}
 	r.probeHoldMu.Lock()
 	defer r.probeHoldMu.Unlock()
-	r.probeController.Advance(instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), SendStartedAt: sendStartedAt, Snapshots: probeSnapshots(quota)})
+	r.probeController.Advance(instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), SendStartedAt: sendStartedAt, SendCompletedAt: sendCompletedAt, Snapshots: probeSnapshots(quota)})
 	return r.persistTerminalProbeCompletionLocked(instance, attemptID, quota, phases...)
 }
 
@@ -1449,7 +1449,11 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			if err != nil {
 				return fail(err, true)
 			}
-			if err = r.persistVerifiedProbeCompletion(intent.Instance, attempt.AttemptID, attempt.CreatedAt, vr.Quota, ProbeAttemptSending, ProbeAttemptSent, ProbeAttemptSentUnknown); err != nil {
+			sendCompletedAt := attempt.CreatedAt
+			if attempt.SentAt != nil {
+				sendCompletedAt = *attempt.SentAt
+			}
+			if err = r.persistVerifiedProbeCompletion(intent.Instance, attempt.AttemptID, attempt.CreatedAt, sendCompletedAt, vr.Quota, ProbeAttemptSending, ProbeAttemptSent, ProbeAttemptSentUnknown); err != nil {
 				recordFailure(err, true, p.Windows)
 				return OperationResult{Token: intent.Token, Err: err}
 			}
@@ -1586,7 +1590,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			return fail(err, true)
 		}
 		r.probeHoldMu.Lock()
-		r.probeController.Advance(intent.Instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), SendStartedAt: attempt.CreatedAt, Snapshots: probeSnapshots(vr.Quota)})
+		r.probeController.Advance(intent.Instance, ProbeEvent{Kind: ProbeEventVerifyResult, Now: r.now(), SendStartedAt: attempt.CreatedAt, SendCompletedAt: sentAt, Snapshots: probeSnapshots(vr.Quota)})
 		for _, k := range lazy {
 			if w, ok := r.probeController.Window(intent.Instance, k); ok && w.State == ProbeRetryWait && w.Deadline.Before(attempt.SuppressUntil) {
 				w.Deadline = attempt.SuppressUntil

@@ -46,6 +46,7 @@ type ProbeEvent struct {
 	Window              ProbeWindowKind
 	Now                 time.Time
 	SendStartedAt       time.Time
+	SendCompletedAt     time.Time
 	Snapshots           map[ProbeWindowKind]QuotaSnapshot
 	RefreshMode         RefreshMode
 	ObservationInterval time.Duration
@@ -177,7 +178,7 @@ func (c *ProbeController) Advance(i AuthInstanceID, e ProbeEvent) []Intent {
 				continue
 			}
 			baseline := w.Baseline
-			if e.Kind == ProbeEventVerifyResult && resetAnchoredAfterActivation(baseline, snap, e.SendStartedAt, e.Now) {
+			if e.Kind == ProbeEventVerifyResult && resetAnchoredAfterActivation(baseline, snap, e.SendStartedAt, e.SendCompletedAt, e.Now) {
 				baseline.ResetAt = *snap.ResetAt
 				baseline.Usage = *snap.Usage
 				baseline.SuspectedLazy = false
