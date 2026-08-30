@@ -1,0 +1,3 @@
+# Collapse test sources in GitHub language stats and default diff views.
+# They stay fully tracked, built and run; this only affects presentation.
+*_test.go linguist-vendored
