@@ -2381,3 +2381,57 @@ func TestManagementPageProbeButtonCallsTheTriggerRoute(t *testing.T) {
 		t.Fatal("management page persists the CPA management key")
 	}
 }
+
+// TestManagementPageSurfacesProbeState guards the reset-probe observability the
+// page previously discarded: the backend has always serialized reset_probes,
+// but the shell rendered none of it, which is how a probe that answered 404 on
+// every activation stayed invisible. These keys are what an operator reads to
+// answer "did the 5-hour probe run, and is it healthy".
+func TestManagementPageSurfacesProbeState(t *testing.T) {
+	store := NewPluginState(DefaultConfig())
+	resp := HandleManagementRequest(store, pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/resource/plugins/codex-quota-scheduler/status",
+	}, time.Date(2026, 8, 30, 3, 0, 0, 0, time.UTC))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, resp.Body)
+	}
+	page := string(resp.Body)
+
+	for _, key := range []string{
+		"probePanel",           // the panel exists at all
+		"probeTimes",           // configured trigger times
+		"probeNext",            // next trigger
+		"probeLastVerified",    // last confirmed activation
+		"probeAlert",           // failure banner
+		"probe.failedCount",    // and its localized copy
+		"probe.rowVerified",
+		"probe.rowFailed",
+		"probe.rowActive",
+		"probe.rowPending",
+		"logs.filterProbe",     // probe-only log view
+	} {
+		if !strings.Contains(page, key) {
+			t.Errorf("status page missing probe key %q", key)
+		}
+	}
+}
+
+// TestProbeLogFilterDefaultsToProbe pins the default log view. scheduler.selected
+// is written on every Codex request into a 200-entry ring buffer, so a default
+// of "all" scrolls probe events out of reach exactly when they are needed.
+func TestProbeLogFilterDefaultsToProbe(t *testing.T) {
+	store := NewPluginState(DefaultConfig())
+	resp := HandleManagementRequest(store, pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/resource/plugins/codex-quota-scheduler/status",
+	}, time.Date(2026, 8, 30, 3, 0, 0, 0, time.UTC))
+	page := string(resp.Body)
+
+	if !strings.Contains(page, "let logLevelFilter='probe'") {
+		t.Error("log filter must default to the probe view, not all")
+	}
+	if !strings.Contains(page, `data-level="probe" aria-pressed="true"`) {
+		t.Error("probe filter button must render pre-selected to match the default")
+	}
+}
