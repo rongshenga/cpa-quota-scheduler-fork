@@ -2399,17 +2399,17 @@ func TestManagementPageSurfacesProbeState(t *testing.T) {
 	page := string(resp.Body)
 
 	for _, key := range []string{
-		"probePanel",           // the panel exists at all
-		"probeTimes",           // configured trigger times
-		"probeNext",            // next trigger
-		"probeLastVerified",    // last confirmed activation
-		"probeAlert",           // failure banner
-		"probe.failedCount",    // and its localized copy
+		"probePanel",        // the panel exists at all
+		"probeTimes",        // configured trigger times
+		"probeNext",         // next trigger
+		"probeLastVerified", // last confirmed activation
+		"probeAlert",        // failure banner
+		"probe.failedCount", // and its localized copy
 		"probe.rowVerified",
 		"probe.rowFailed",
 		"probe.rowActive",
 		"probe.rowPending",
-		"logs.filterProbe",     // probe-only log view
+		"logs.filterProbe", // probe-only log view
 	} {
 		if !strings.Contains(page, key) {
 			t.Errorf("status page missing probe key %q", key)
@@ -2434,4 +2434,206 @@ func TestProbeLogFilterDefaultsToProbe(t *testing.T) {
 	if !strings.Contains(page, `data-level="probe" aria-pressed="true"`) {
 		t.Error("probe filter button must render pre-selected to match the default")
 	}
+}
+
+// statusStylesheet returns the <style> block of the rendered management page.
+func statusStylesheet(t *testing.T, html string) string {
+	t.Helper()
+	start := strings.Index(html, "<style>")
+	end := strings.Index(html, "</style>")
+	if start < 0 || end < start {
+		t.Fatalf("rendered page has no stylesheet: %s", html)
+	}
+	return html[start+len("<style>") : end]
+}
+
+func renderStatusPage(t *testing.T) string {
+	t.Helper()
+	now := time.Date(2026, 6, 21, 9, 0, 0, 0, time.UTC)
+	store := NewPluginState(DefaultConfig())
+	account := weeklyAccount("auth-1", 5, now.Add(24*time.Hour), false)
+	account.LastSuccessAt = now
+	store.UpsertQuota(account)
+
+	resp := HandleManagementRequest(store, pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/status"}, now)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, resp.Body)
+	}
+	return string(resp.Body)
+}
+
+// The page renders inside the dark CPAMP panel, so no fill may be an opaque
+// near-white block. Translucent white films (rgba(255,255,255,.07)) stay legal
+// because they only tint the dark surface underneath.
+func TestStatusHTMLStylesheetHasNoOpaqueLightFill(t *testing.T) {
+	css := statusStylesheet(t, renderStatusPage(t))
+
+	decl := regexp.MustCompile(`background(?:-color)?:[^;}]*`)
+	hex := regexp.MustCompile(`#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})\b`)
+	rgb := regexp.MustCompile(`rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([0-9.]+)\s*)?\)`)
+
+	channel := func(s string) int {
+		v := 0
+		for _, r := range s {
+			v = v*16 + strings.Index("0123456789abcdef", strings.ToLower(string(r)))
+		}
+		return v
+	}
+
+	for _, d := range decl.FindAllString(css, -1) {
+		if strings.Contains(d, "white") {
+			t.Fatalf("stylesheet declares a white fill: %q", d)
+		}
+		for _, m := range hex.FindAllStringSubmatch(d, -1) {
+			digits := m[1]
+			if len(digits) == 3 {
+				digits = string([]byte{digits[0], digits[0], digits[1], digits[1], digits[2], digits[2]})
+			}
+			r, g, b := channel(digits[0:2]), channel(digits[2:4]), channel(digits[4:6])
+			if r >= 0xE0 && g >= 0xE0 && b >= 0xE0 {
+				t.Fatalf("stylesheet fills with near-white %s in %q", m[0], d)
+			}
+		}
+		for _, m := range rgb.FindAllStringSubmatch(d, -1) {
+			if m[1] < "224" && len(m[1]) < 3 {
+				continue
+			}
+			alpha := m[4]
+			if alpha == "" {
+				alpha = "1"
+			}
+			opaque := alpha == "1" || (strings.HasPrefix(alpha, ".") && alpha > ".5") || (strings.HasPrefix(alpha, "0.") && alpha > "0.5")
+			if !opaque {
+				continue
+			}
+			if m[1] == "255" && m[2] == "255" && m[3] == "255" {
+				t.Fatalf("stylesheet fills with opaque white %s in %q", m[0], d)
+			}
+		}
+	}
+}
+
+// <code> carried no surface of its own, so the two account-text metrics and the
+// auth-id under each card title fell back to the browser/host default block.
+func TestStatusHTMLGivesEveryCodeRegionAnExplicitDarkSurface(t *testing.T) {
+	html := renderStatusPage(t)
+	css := statusStylesheet(t, html)
+
+	for _, want := range []string{
+		`<code class="metric-value" id="metricNextAuthID">`,
+		`<code class="metric-value" id="metricLastSelected">`,
+		`<div class="sub"><code>`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("page no longer renders code region %q: %s", want, html)
+		}
+	}
+
+	// The base rule must paint a surface instead of inheriting one, and must sit
+	// above the bare `code` element selector a host sheet can tie on.
+	base := ruleFor(t, css, "body code")
+	if !strings.Contains(base, "background:") {
+		t.Fatalf("base code rule declares no background: %q", base)
+	}
+	if strings.Contains(css, "\ncode{") {
+		t.Fatalf("bare `code{` rule is back and can be overridden by a host sheet: %s", css)
+	}
+
+	// Account text keeps card/metric hierarchy: it must neutralise the chip
+	// rather than stack another box on top of it.
+	for _, sel := range []string{"code.metric-value", ".sub code"} {
+		rule := ruleFor(t, css, sel)
+		if !strings.Contains(rule, "background:transparent") {
+			t.Fatalf("%s does not neutralise the code chip background: %q", sel, rule)
+		}
+	}
+	if !strings.Contains(ruleFor(t, css, ".sub"), "overflow-wrap:anywhere") {
+		t.Fatalf(".sub must keep wrapping long auth ids: %s", css)
+	}
+}
+
+// The dark rewrite dropped every dialog rule, leaving the edit modal on the
+// browser default surface.
+func TestStatusHTMLStylesDarkEditDialogAndStaysResponsive(t *testing.T) {
+	css := statusStylesheet(t, renderStatusPage(t))
+
+	for _, sel := range []string{
+		"#editDialog",
+		"#editDialog::backdrop",
+		".dialogBody",
+		".dialogHead",
+		".dialogGrid",
+		".dialogGrid .wide",
+		".dialogActions",
+	} {
+		if !strings.Contains(css, sel+"{") {
+			t.Fatalf("stylesheet is missing dialog rule %q: %s", sel, css)
+		}
+	}
+	if !strings.Contains(ruleFor(t, css, "#editDialog"), "background:") {
+		t.Fatalf("dialog still relies on the browser default surface: %s", css)
+	}
+
+	narrow := css[strings.Index(css, "@media(max-width:900px)"):]
+	narrow = narrow[:strings.Index(narrow, "\n")]
+	if !strings.Contains(narrow, ".dialogGrid{grid-template-columns:1fr}") {
+		t.Fatalf("dialog grid does not collapse on narrow viewports: %q", narrow)
+	}
+}
+
+// Buttons stay identifiable against the dark card instead of reading as a white
+// action strip along the bottom edge.
+func TestStatusHTMLKeepsCardActionBarDark(t *testing.T) {
+	css := statusStylesheet(t, renderStatusPage(t))
+
+	if strings.Contains(css, "\nbutton{") {
+		t.Fatalf("bare `button{` rule can be tied by a host sheet: %s", css)
+	}
+	if !strings.Contains(ruleFor(t, css, "body button"), "background:") {
+		t.Fatalf("base button rule declares no background: %s", css)
+	}
+	if !strings.Contains(ruleFor(t, css, ".cardActions"), "border-top:") {
+		t.Fatalf("card action bar has no separator: %s", css)
+	}
+	if !strings.Contains(ruleFor(t, css, ".cardActions"), "background:transparent") {
+		t.Fatalf("card action bar must override CPAMP's [class*='card'] host fill: %s", css)
+	}
+
+	ghost := ruleFor(t, css, "button.ghost")
+	if strings.Contains(ghost, "rgba(255,255,255") {
+		t.Fatalf("ghost buttons still use a white film that washes out on a light backdrop: %q", ghost)
+	}
+	// Secondary keeps its own tint so the two card actions stay distinguishable.
+	if ruleFor(t, css, "button.secondary") == ghost {
+		t.Fatalf("ghost and secondary buttons are painted identically: %q", ghost)
+	}
+}
+
+// CPAMP injects a zero-specificity host rule for [class*='card'] and
+// [class*='panel']. These structural child class names match it too, so they
+// must explicitly clear the host surface instead of inheriting an opaque white
+// background in dark mode.
+func TestStatusHTMLClearsCPAMPSubstringHostSurfaces(t *testing.T) {
+	css := statusStylesheet(t, renderStatusPage(t))
+	for _, selector := range []string{".panel-head", ".cardTop", ".cardActions"} {
+		if !strings.Contains(ruleFor(t, css, selector), "background:transparent") {
+			t.Fatalf("%s does not override CPAMP substring host surface: %q", selector, ruleFor(t, css, selector))
+		}
+	}
+}
+
+// ruleFor returns the declaration block of the given selector.
+func ruleFor(t *testing.T, css, selector string) string {
+	t.Helper()
+	needle := "\n" + selector + "{"
+	start := strings.Index(css, needle)
+	if start < 0 {
+		t.Fatalf("stylesheet has no rule for %q: %s", selector, css)
+	}
+	start += len(needle)
+	end := strings.Index(css[start:], "}")
+	if end < 0 {
+		t.Fatalf("unterminated rule for %q", selector)
+	}
+	return css[start : start+end]
 }
