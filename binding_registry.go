@@ -103,7 +103,7 @@ func (r *BindingRegistry) ReconcileRoster(ctx context.Context, roster HostRoster
 	if roster.Capability != CapabilityA {
 		return RosterReconcileResult{}, ErrCapabilityB
 	}
-	_, ids, ok := HighestCodexTier(roster.Entries)
+	_, ids, ok := AllCodexRoster(roster.Entries)
 	if !ok {
 		return RosterReconcileResult{}, ErrBindingNotRosterConfirmed
 	}

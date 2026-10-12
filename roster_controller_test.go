@@ -228,7 +228,7 @@ func TestSuiteRosterManagement(t *testing.T) {
 
 	t.Run("startup, ttl, idle, probe and management wakes", func(t *testing.T) {
 		got, err := c.Startup(context.Background())
-		if err != nil || !got.Confirmed || got.HighestPriority != 9 || len(got.Instances) != 2 {
+		if err != nil || !got.Confirmed || got.HighestPriority != 9 || len(got.Instances) != 3 {
 			t.Fatalf("startup = %#v, %v", got, err)
 		}
 		clock = now.Add(rosterActiveTTL - time.Nanosecond)
@@ -294,7 +294,7 @@ func TestSuiteRosterManagement(t *testing.T) {
 		}
 		clock = firstFailure.Add(rosterDegradedLimit + time.Nanosecond)
 		got, _ = c.WakeForProbe(context.Background())
-		if got.Health != RosterFailClosed || len(got.Instances) != 2 {
+		if got.Health != RosterFailClosed || len(got.Instances) != 3 {
 			t.Fatalf("after boundary=%#v", got)
 		}
 		host.setError(nil)

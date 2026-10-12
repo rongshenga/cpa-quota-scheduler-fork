@@ -209,7 +209,14 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 		controller := globalRosterController
 		refresherMu.Unlock()
 		if controller != nil {
-			_, _ = controller.Startup(context.Background())
+			if _, err := controller.Startup(context.Background()); err != nil {
+				// CPA finishes loading auth files shortly after plugin init. One
+				// bounded retry avoids leaving the roster on its persisted snapshot
+				// until unrelated request activity happens to wake it.
+				timer := time.NewTimer(2 * time.Second)
+				<-timer.C
+				_, _ = controller.Startup(context.Background())
+			}
 		}
 	}()
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)

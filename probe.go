@@ -30,11 +30,9 @@ const (
 	// never be the thing that answers that question.
 	codexResetProbeEndpointLabel = "codex_responses"
 
-	// Use the lowest-priced Codex model exposed by the installed catalog. The
-	// CPA logs also show gpt-5.6-luna being accepted by the subscription
-	// endpoint (quota/auth responses, not an unknown-model error), so it is a
-	// valid and cheaper probe model than gpt-5.4-mini.
-	codexResetProbeModel        = "gpt-5.6-luna"
+	// 使用当前 Codex 标准档积分价格最低的文本模型，周限与 5h 激活共用。
+	// 仅更新模型，不改变请求格式、调度规则或失败处理。
+	codexResetProbeModel        = "gpt-6-luna"
 	codexResetProbeInstructions = "You are a helpful assistant."
 	codexResetProbePrompt       = "hi"
 

@@ -108,3 +108,28 @@ func HighestCodexTier(entries []RosterEntry) (priority int, ids []string, ok boo
 	sort.Strings(ids)
 	return priority, ids, true
 }
+
+// AllCodexRoster returns every valid Codex credential regardless of its CPA
+// priority. The maximum priority is retained only as management metadata; it
+// is not an admission boundary for refresh or reset probing.
+func AllCodexRoster(entries []RosterEntry) (maxPriority int, ids []string, ok bool) {
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.ID == "" || entry.Provider != "codex" || entry.Priority == nil {
+			continue
+		}
+		if !ok || *entry.Priority > maxPriority {
+			maxPriority = *entry.Priority
+		}
+		ok = true
+		if _, exists := seen[entry.ID]; !exists {
+			seen[entry.ID] = struct{}{}
+			ids = append(ids, entry.ID)
+		}
+	}
+	if !ok {
+		return 0, nil, false
+	}
+	sort.Strings(ids)
+	return maxPriority, ids, true
+}

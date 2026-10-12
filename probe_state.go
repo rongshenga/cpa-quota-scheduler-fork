@@ -88,8 +88,9 @@ func (c *ProbeController) NextDeadline() time.Time {
 	defer c.mu.Unlock()
 	var out time.Time
 	for _, ws := range c.windows {
-		for _, w := range ws {
-			if w.State != ProbeWaitingReset && w.State != ProbeRetryWait && w.State != ProbeAnomalyHold {
+		for k, w := range ws {
+			confirmedWeekly := w.State == ProbeConfirmed && !confirmedWeeklyDeadline(k, w.Baseline).IsZero()
+			if w.State != ProbeWaitingReset && w.State != ProbeRetryWait && w.State != ProbeAnomalyHold && !confirmedWeekly {
 				continue
 			}
 			if !w.Deadline.IsZero() && (out.IsZero() || w.Deadline.Before(out)) {
@@ -163,7 +164,8 @@ func (c *ProbeController) Advance(i AuthInstanceID, e ProbeEvent) []Intent {
 		}
 		switch e.Kind {
 		case ProbeEventDeadline:
-			if (w.State == ProbeWaitingReset || w.State == ProbeRetryWait || w.State == ProbeAnomalyHold) && !w.Deadline.After(e.Now) {
+			confirmedWeekly := w.State == ProbeConfirmed && !w.Deadline.IsZero() && !confirmedWeeklyDeadline(k, w.Baseline).IsZero()
+			if (w.State == ProbeWaitingReset || w.State == ProbeRetryWait || w.State == ProbeAnomalyHold || confirmedWeekly) && !w.Deadline.After(e.Now) {
 				w.State = ProbePendingCheck
 				w.Deadline = time.Time{}
 				ws[k] = w
@@ -184,7 +186,7 @@ func (c *ProbeController) Advance(i AuthInstanceID, e ProbeEvent) []Intent {
 				baseline.SuspectedLazy = false
 				w.Baseline = baseline
 				w.State = ProbeConfirmed
-				w.Deadline = time.Time{}
+				w.Deadline = confirmedWeeklyDeadline(k, w.Baseline)
 				w.AttemptID = ""
 				ws[k] = w
 				continue
@@ -222,7 +224,7 @@ func (c *ProbeController) Advance(i AuthInstanceID, e ProbeEvent) []Intent {
 			switch cl.Kind {
 			case ProbeActivatedNew, ProbeActivatedInferred:
 				w.State = ProbeConfirmed
-				w.Deadline = time.Time{}
+				w.Deadline = confirmedWeeklyDeadline(k, w.Baseline)
 			case ProbeNotDueYet:
 				w.State = ProbeWaitingReset
 				w.Deadline = deadlineFor(w.Baseline, e.Now, e.ObservationInterval)

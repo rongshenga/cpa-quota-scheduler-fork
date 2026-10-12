@@ -38,15 +38,16 @@ type probeSequencePayload struct {
 // hard "never send activation requests outside these hours" policy rather than
 // a schedule.
 type probeSendGate struct {
-	Manual         bool
-	WindowAllowed  bool
-	TriggerAllowed bool
-	Allowed        bool
-	SendWindows    string
-	TriggerTimes   string
-	Timezone       string
-	Location       *time.Location
-	TriggerMinutes []int
+	Manual           bool
+	WeeklyActivation bool
+	WindowAllowed    bool
+	TriggerAllowed   bool
+	Allowed          bool
+	SendWindows      string
+	TriggerTimes     string
+	Timezone         string
+	Location         *time.Location
+	TriggerMinutes   []int
 }
 
 const probeGatePolicy = "manual_bypasses_trigger_times_respects_send_windows"
@@ -91,6 +92,7 @@ func (g probeSendGate) apply(fields map[string]any) map[string]any {
 	fields["trigger_allowed"] = g.TriggerAllowed
 	fields["send_window_allowed"] = g.WindowAllowed
 	fields["manual_bypassed_trigger_gate"] = g.BypassedTriggerGate()
+	fields["weekly_bypassed_trigger_gate"] = g.WeeklyActivation && g.Allowed && !g.TriggerAllowed
 	fields["gate_policy"] = probeGatePolicy
 	fields["send_windows"] = g.SendWindows
 	fields["trigger_times"] = g.TriggerTimes
@@ -312,8 +314,36 @@ func (r *QuotaRefresher) bootstrapProbeWindows() error {
 	for instance := range r.probePersistPending {
 		touched[instance] = struct{}{}
 	}
+	// Registration may load schedule settings after runtime construction.
+	// Migrate here under the same lock as all controller/persistence changes.
+	if r.runtimeStore != nil {
+		persisted, err := r.runtimeStore.PersistentSnapshot()
+		if err != nil {
+			return err
+		}
+		persisted.ProbeWindows = r.probeController.Snapshot()
+		if rearmScheduledWeeklyWindows(&persisted, r.state.Config(), now) {
+			for instance, windows := range persisted.ProbeWindows {
+				w, ok := windows[ProbeWindowLong]
+				current, exists := r.probeController.Window(instance, ProbeWindowLong)
+				if ok && exists && !w.Deadline.Equal(current.Deadline) {
+					r.probeController.SetWindow(instance, ProbeWindowLong, w)
+					touched[instance] = struct{}{}
+				}
+			}
+		}
+	}
 	for instance, windows := range r.probeController.Snapshot() {
 		for kind, window := range windows {
+			if window.State == ProbeConfirmed {
+				deadline := confirmedWeeklyDeadline(kind, window.Baseline)
+				if !deadline.IsZero() && !window.Deadline.Equal(deadline) {
+					window.Deadline = deadline
+					r.probeController.SetWindow(instance, kind, window)
+					touched[instance] = struct{}{}
+				}
+				continue
+			}
 			if window.State != ProbeWaitingReset || window.Baseline.Kind != ProbeBaselineReset || window.Baseline.WindowLength <= 0 {
 				continue
 			}
@@ -609,6 +639,72 @@ func (r *QuotaRefresher) reconcileObservedProbeWindows(instance AuthInstanceID, 
 	return nil
 }
 
+// 仅接受当前账号版本的成功额度查询，不用业务反馈或旧缓存解除认证阻断。
+func (r *QuotaRefresher) recoverProbeAuthFromQuota(authID string, write WritebackVersion, quota ParsedQuota, observedAt time.Time) (bool, error) {
+	if r.bindings == nil || r.runtimeStore == nil || r.probeController == nil || observedAt.IsZero() || observedAt.After(r.now()) {
+		return false, nil
+	}
+	r.bindings.mu.Lock()
+	defer r.bindings.mu.Unlock()
+	binding, ok := r.bindings.bindings[authID]
+	if !ok || !ValidateWriteback(BindingVersion{Instance: binding.Instance, Admission: binding.Admission, Tier: TierGeneration(binding.Generation), Login: binding.Login, Fingerprint: binding.Fingerprint}, write) {
+		return false, ErrStaleExecutionToken
+	}
+	r.probeHoldMu.Lock()
+	defer r.probeHoldMu.Unlock()
+	blocked := binding.AuthBlocked
+	for _, window := range r.probeController.Snapshot()[binding.Instance] {
+		blocked = blocked || window.State == ProbeAuthBlocked
+	}
+	if !blocked {
+		return false, nil
+	}
+	snapshots := probeSnapshots(quota)
+	committed, err := r.runtimeStore.UpdateMirrored(func(state *PersistentState) error {
+		current, ok := state.Bindings[authID]
+		if !ok || !ValidateWriteback(BindingVersion{Instance: current.Instance, Admission: current.Admission, Tier: TierGeneration(current.Generation), Login: current.Login, Fingerprint: current.Fingerprint}, write) {
+			return ErrStaleExecutionToken
+		}
+		current.AuthBlocked = false
+		state.Bindings[authID] = current
+		attempt := state.ProbeAttempts[binding.Instance]
+		for kind, window := range state.ProbeWindows[binding.Instance] {
+			if window.State != ProbeAuthBlocked {
+				continue
+			}
+			// 用本次观测替换过期基线，避免数日前的时间差反复触发异常暂停。
+			if snap, ok := snapshots[kind]; ok && snap.Valid && snap.Usage != nil {
+				window.Baseline = ClassifyProbeWindow(ProbeBaseline{}, snap, observedAt).Baseline
+				if snap.ResetAt != nil && snap.WindowLengthKnown {
+					observation := QuotaWindow{Kind: snap.WindowKind, UsedPercent: snap.Usage, ResetAt: *snap.ResetAt}
+					window.Baseline.SuspectedLazy = looksLikeStrictLazyObservation(observedAt, observation, snap.WindowLength)
+				}
+			}
+			window.State = ProbePendingCheck
+			window.Deadline = time.Time{}
+			window.AuthBlockedAtLogin = 0
+			window.RetryCount = 0
+			window.AttemptID = ""
+			switch attempt.Phase {
+			case ProbeAttemptSending, ProbeAttemptSent, ProbeAttemptSentUnknown:
+				if attemptReferencesWindow(attempt, kind) {
+					// 保留发送日志和屏障；未知结果必须只读恢复，不能重新发送。
+					window.State = ProbeSentUnknown
+					window.AttemptID = attempt.AttemptID
+				}
+			}
+			state.ProbeWindows[binding.Instance][kind] = window
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	r.bindings.bindings = committed.Bindings
+	r.syncProbeControllerInstance(binding.Instance, committed)
+	return true, nil
+}
+
 func rearmConfirmedProbeWindow(window ProbeWindow, observedAt time.Time, observation *QuotaWindow, now time.Time, observationInterval time.Duration) (ProbeWindow, bool) {
 	if window.State != ProbeConfirmed || observation == nil || observation.UsedPercent == nil || observation.ResetAt.IsZero() || observedAt.IsZero() || observedAt.After(now) {
 		return window, false
@@ -772,7 +868,7 @@ func (r *QuotaRefresher) persistProbeFailure(instance AuthInstanceID, attemptID 
 					window.Deadline = now.Add(probeBackoff(window.RetryCount))
 				} else {
 					cfg := r.state.Config()
-					window.Deadline = probeFailureDeadline(cfg.ProbeTriggerMinutes, cfg.ProbeSendTimezone, now, window.RetryCount)
+					window.Deadline = probeWindowFailureDeadline(kind, window.Baseline, cfg, now, window.RetryCount)
 				}
 			}
 			next[kind] = window
@@ -1494,6 +1590,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		// send-window half; see probeSendGate.
 		now := r.now()
 		gate := r.evaluateProbeSendGate(now, p.Manual)
+		gate = gate.withWeeklyActivation(lazy, pre.Quota)
 		sendAllowed := gate.Allowed
 		sendDecisionGate = &gate
 		resultFields := gateFields(gate, p.Windows, false)

@@ -303,11 +303,8 @@ func (r *QuotaRefresher) ProvisionalRoster() *ActiveRoster {
 	}
 	active := &ActiveRoster{Capability: CapabilityB, Provisional: true, Generation: persisted.Generation, ConfirmedAt: persisted.ConfirmedAt, Health: RosterWaiting}
 	seen := make(map[string]struct{}, len(persisted.Entries))
-	for i, entry := range persisted.Entries {
+	for _, entry := range persisted.Entries {
 		if entry.ID == "" || entry.AuthIndex == "" || !entry.Fingerprint.ValidHashes() {
-			return nil
-		}
-		if i > 0 && entry.Priority != persisted.Entries[0].Priority {
 			return nil
 		}
 		if _, duplicate := seen[entry.ID]; duplicate {
@@ -317,7 +314,9 @@ func (r *QuotaRefresher) ProvisionalRoster() *ActiveRoster {
 		priority := entry.Priority
 		active.Entries = append(active.Entries, RosterEntry{ID: entry.ID, AuthIndex: entry.AuthIndex, Provider: "codex", Priority: &priority})
 		active.Instances = append(active.Instances, entry.ID)
-		active.HighestPriority = entry.Priority
+		if len(active.Entries) == 1 || entry.Priority > active.HighestPriority {
+			active.HighestPriority = entry.Priority
+		}
 	}
 	sort.Strings(active.Instances)
 	return active
@@ -562,7 +561,7 @@ func (r *QuotaRefresher) PublishAuthoritativeRoster(ctx context.Context, roster 
 	if err := r.retryProbeRosterHold(); err != nil {
 		return err
 	}
-	priority, ids, ok := HighestCodexTier(roster.Entries)
+	priority, ids, ok := AllCodexRoster(roster.Entries)
 	if roster.Capability != CapabilityA || !ok {
 		r.rosterMu.Lock()
 		r.roster = HostRosterSnapshot{Capability: CapabilityB}
@@ -847,8 +846,25 @@ func NewQuotaRefresher(host HostClient, state *PluginState, now func() time.Time
 			if applyErr != nil {
 				return applyErr
 			}
+			authRecovered := false
+			for _, account := range result.Journal.Accounts {
+				if account.AuthID != intent.AuthID || account.ChatGPTAccountID == "" || account.LastSuccessAt.IsZero() || account.LastError != "" {
+					continue
+				}
+				recovered, err := r.recoverProbeAuthFromQuota(intent.AuthID, WritebackVersion{Token: result.Token, Login: result.Login, Fingerprint: result.Fingerprint}, account.Quota, account.LastSuccessAt)
+				if err != nil {
+					return err
+				}
+				if recovered {
+					authRecovered = true
+					r.state.RecordLog("info", "probe.auth_recovered", "额度查询成功，已解除旧的探针认证阻断", map[string]any{"auth_id": intent.AuthID}, r.now())
+				}
+			}
 			if err := r.bootstrapProbeWindows(); err != nil {
 				r.state.RecordLog("warn", "probe.bootstrap_failed", "Probe 状态初始化失败，将在下次刷新重试", map[string]any{"auth_id": intent.AuthID, "error": redactSecrets(err.Error())}, r.now())
+			} else if authRecovered {
+				// 先只读核验可能已发送的旧请求，再按原调度处理新窗口。
+				r.launchProbe(true)
 			} else if r.probeController != nil && hasPendingProbeWindows(r.probeController.Snapshot()) {
 				r.launchProbe(false)
 			}
@@ -2181,7 +2197,7 @@ func (r *QuotaRefresher) upsertRefreshFailure(account AccountState, version uint
 }
 
 func highestTierSet(roster HostRosterSnapshot) map[string]struct{} {
-	_, ids, ok := HighestCodexTier(roster.Entries)
+	_, ids, ok := AllCodexRoster(roster.Entries)
 	if !ok {
 		return nil
 	}

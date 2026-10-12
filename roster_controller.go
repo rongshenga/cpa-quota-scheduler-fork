@@ -226,7 +226,7 @@ func (c *RosterController) finishSync(ctx context.Context, entries []RosterEntry
 	done := c.inFlight
 	old := cloneActiveRoster(c.current)
 	if syncErr == nil {
-		priority, ids, ok := HighestCodexTier(entries)
+		priority, ids, ok := AllCodexRoster(entries)
 		if !ok {
 			syncErr = errors.New("authoritative host roster has no confirmed codex tier")
 		} else {
