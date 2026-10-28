@@ -66,6 +66,21 @@ func (s *PluginState) applyLegacyEffectJournal(j LegacyEffectJournal) {
 	defer s.mu.Unlock()
 	for _, account := range j.Accounts {
 		if key := accountStateKey(account); key != "" {
+			if current, ok := s.accounts[key]; ok {
+				if current.QuotaReadStartedAt.After(account.QuotaReadStartedAt) || current.LastSuccessAt.After(account.LastSuccessAt) {
+					account.Quota, account.Family = current.Quota, current.Family
+					account.QuotaReadStartedAt, account.QuotaObservedAt = current.QuotaReadStartedAt, current.QuotaObservedAt
+					account.Stale = current.Stale
+					account.LastSuccessAt, account.LastRefreshAt = current.LastSuccessAt, current.LastRefreshAt
+					account.LastError, account.Refresh = current.LastError, current.Refresh
+					account.TemporaryExhausted, account.TemporaryResetAt = current.TemporaryExhausted, current.TemporaryResetAt
+				}
+				if current.QuotaFailureAt.After(account.QuotaFailureAt) {
+					account.TemporaryExhausted, account.TemporaryResetAt = current.TemporaryExhausted, current.TemporaryResetAt
+					account.QuotaFailureAt = current.QuotaFailureAt
+					account.FailureFiveResetAt, account.FailureLongResetAt = current.FailureFiveResetAt, current.FailureLongResetAt
+				}
+			}
 			s.accounts[key] = cloneAccountState(account)
 		}
 	}
@@ -223,7 +238,7 @@ func (s *PluginState) UpsertQuota(account AccountState) {
 	s.accounts[key] = cloneAccountState(account)
 }
 
-func (s *PluginState) MarkAccountTemporaryExhausted(authID string, resetAt time.Time, reason string) {
+func (s *PluginState) MarkAccountTemporaryExhausted(authID string, resetAt time.Time, reason string, observed ...time.Time) {
 	if authID == "" {
 		return
 	}
@@ -234,10 +249,21 @@ func (s *PluginState) MarkAccountTemporaryExhausted(authID string, resetAt time.
 		account = AccountState{AuthID: authID}
 	}
 	markTemporaryExhausted(&account, resetAt, reason)
+	account.QuotaFailureAt = time.Now()
+	if len(observed) > 0 {
+		account.QuotaFailureAt = observed[0]
+	}
+	account.FailureFiveResetAt, account.FailureLongResetAt = time.Time{}, time.Time{}
+	if account.Quota.FiveHour != nil {
+		account.FailureFiveResetAt = account.Quota.FiveHour.ResetAt
+	}
+	if account.Quota.LongWindow != nil {
+		account.FailureLongResetAt = account.Quota.LongWindow.ResetAt
+	}
 	s.accounts["auth:"+authID] = account
 }
 
-func (s *PluginState) MarkAccountTemporaryExhaustedByAuthIndex(authIndex string, resetAt time.Time, reason string) {
+func (s *PluginState) MarkAccountTemporaryExhaustedByAuthIndex(authIndex string, resetAt time.Time, reason string, observed ...time.Time) {
 	if authIndex == "" {
 		return
 	}
@@ -248,6 +274,17 @@ func (s *PluginState) MarkAccountTemporaryExhaustedByAuthIndex(authIndex string,
 			continue
 		}
 		markTemporaryExhausted(&account, resetAt, reason)
+		account.QuotaFailureAt = time.Now()
+		if len(observed) > 0 {
+			account.QuotaFailureAt = observed[0]
+		}
+		account.FailureFiveResetAt, account.FailureLongResetAt = time.Time{}, time.Time{}
+		if account.Quota.FiveHour != nil {
+			account.FailureFiveResetAt = account.Quota.FiveHour.ResetAt
+		}
+		if account.Quota.LongWindow != nil {
+			account.FailureLongResetAt = account.Quota.LongWindow.ResetAt
+		}
 		s.accounts[key] = account
 		return
 	}

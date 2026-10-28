@@ -14,6 +14,7 @@ type OperationClass string
 const (
 	OperationLegacyRefresh OperationClass = "legacy_refresh"
 	OperationQuotaRead     OperationClass = "quota_read"
+	OperationQuotaRecovery OperationClass = "quota_recovery"
 	OperationProbePrecheck OperationClass = "probe_precheck"
 	OperationProbeVerify   OperationClass = "probe_verify"
 	OperationProbeSequence OperationClass = "probe_sequence"

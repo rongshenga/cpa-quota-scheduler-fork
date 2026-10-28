@@ -35,6 +35,7 @@ type ResetCredit struct {
 }
 
 type ParsedQuota struct {
+	UsageLimitReached            bool          `json:"usage_limit_reached,omitempty"`
 	PlanType                     string        `json:"plan_type,omitempty"`
 	Family                       AccountFamily `json:"family"`
 	FiveHour                     *QuotaWindow  `json:"five_hour,omitempty"`
@@ -150,6 +151,11 @@ type AccountState struct {
 	Stale                 bool
 	TemporaryExhausted    bool
 	TemporaryResetAt      time.Time
+	QuotaFailureAt        time.Time
+	QuotaReadStartedAt    time.Time
+	QuotaObservedAt       time.Time
+	FailureFiveResetAt    time.Time
+	FailureLongResetAt    time.Time
 	Circuit               CircuitBreakerState
 	Refresh               AccountRefreshState
 	ResetProbes           map[WindowKind]ResetProbeState
