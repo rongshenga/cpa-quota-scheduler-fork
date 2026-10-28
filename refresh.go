@@ -262,6 +262,11 @@ type QuotaRefresher struct {
 	txnLease               *HeldLease
 	txnPermit              func() bool
 	finalPublicationHook   func()
+	quotaObservations      chan quotaObservation
+	quotaObservationDone   chan struct{}
+	recoveryRunning        bool
+	recoveryRetryAt        time.Time
+	recoveryMu             sync.Mutex
 }
 
 // NewProductionQuotaRefresher wires S2 persistence/identity primitives into
@@ -792,6 +797,7 @@ func NewQuotaRefresher(host HostClient, state *PluginState, now func() time.Time
 		now = time.Now
 	}
 	r := &QuotaRefresher{
+		quotaObservations: make(chan quotaObservation, 128),
 		host:              host,
 		state:             state,
 		now:               now,
@@ -804,6 +810,9 @@ func NewQuotaRefresher(host HostClient, state *PluginState, now func() time.Time
 		LeaseDuration: legacyLeaseDuration,
 		Now:           now,
 		Execute: func(ctx context.Context, intent Intent, held *HeldLease) OperationResult {
+			if intent.Class == OperationQuotaRecovery {
+				return r.runQuotaRecovery(ctx, intent, held)
+			}
 			if intent.Class != OperationLegacyRefresh {
 				return r.runTypedHeld(ctx, intent, held)
 			}
@@ -822,6 +831,12 @@ func NewQuotaRefresher(host HostClient, state *PluginState, now func() time.Time
 		},
 		Apply: func(intent Intent, result OperationResult) error {
 			if result.Journal == nil {
+				if value, ok := result.Value.(probeReadResult); ok && result.Err == nil {
+					// 已提交的激活终态不能因展示/恢复队列写失败变回 sent_unknown。
+					if err := r.applyProbeQuota(intent, value); err != nil {
+						r.state.RecordLog("warn", "quota.probe_writeback_pending", "探测结果尚未同步到调度状态", nil, r.now())
+					}
+				}
 				return nil
 			}
 			var applyErr error
@@ -1243,6 +1258,9 @@ func (r *QuotaRefresher) Start() {
 	r.wake = wake
 	r.running = true
 	r.stopping = false
+	observationDone := make(chan struct{})
+	r.quotaObservationDone = observationDone
+	go func() { defer close(observationDone); r.consumeQuotaObservations(stop) }()
 	r.mu.Unlock()
 	if r.probeController != nil && r.resetProbeEnabled() {
 		r.launchProbe(true)
@@ -1267,6 +1285,7 @@ func (r *QuotaRefresher) Start() {
 			select {
 			case <-timerC:
 				now := r.now()
+				r.recoverQuotaSoon()
 				r.refreshController.OnDeadline(now)
 				r.RefreshDueSoon()
 				if r.probeController != nil {
@@ -1472,6 +1491,9 @@ func (r *QuotaRefresher) finishProbeLaunch(runErr error, recoveryAttempted bool,
 func (r *QuotaRefresher) nextRefreshLoopDelay() (time.Duration, bool) {
 	now := r.now()
 	deadline := r.refreshController.NextDeadline(now)
+	if recovery := r.quotaRecoveryDeadline(); !recovery.IsZero() && (deadline.IsZero() || recovery.Before(deadline)) {
+		deadline = recovery
+	}
 	if r.probeController != nil && r.resetProbeEnabled() {
 		r.probeRunStateMu.Lock()
 		launchActive := r.probeLaunchActive
@@ -1542,6 +1564,7 @@ func (r *QuotaRefresher) Stop() {
 	running := r.running
 	stop := r.stop
 	done := r.done
+	observationDone := r.quotaObservationDone
 	if running {
 		r.running = false
 	}
@@ -1555,6 +1578,9 @@ func (r *QuotaRefresher) Stop() {
 	}
 	if running {
 		<-done
+		if observationDone != nil {
+			<-observationDone
+		}
 	}
 	r.wg.Wait()
 	if r.coordinator != nil {
@@ -1772,7 +1798,9 @@ func (r *QuotaRefresher) refreshAuthVersionedHeld(auth pluginapi.HostAuthFileEnt
 		}
 		return
 	}
+	account.QuotaReadStartedAt = r.now()
 	quota, err := r.fetchQuota(credentials, account.AuthID, version)
+	account.QuotaObservedAt = r.now()
 	if err != nil {
 		if errors.Is(err, errCPAAdmissionChanged) {
 			return

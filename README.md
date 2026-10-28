@@ -139,6 +139,41 @@ temporarily exhausted until its reported reset time, or for two minutes when no
 reset time is provided. Quota exhaustion does not count as a circuit-breaker
 failure. Repeated non-quota failures use the circuit breaker instead.
 
+### Response quota and CPAMP recovery
+
+This custom branch consumes `x-codex-*` response headers and SSE/WebSocket
+`codex.rate_limits` when `enable_usage_feedback` is enabled. It requires a
+schema-6 CPA host. Successful Probe reads also update the scheduler. Callbacks
+preserve traffic; no model request is added for observation. The custom activation
+schedule, `gpt-6-luna`, and unknown-send safeguards remain. Disabled accounts have
+no normal traffic; unknown early resets still need the existing read-only Probe
+observation (minimum 30 minutes).
+
+CPAMP v1.13.1 needs the companion `recover-verified` endpoint patch. Set a private,
+non-symlink, mode-0600 `cpamp-recovery.json` beside `.runtime-state.json`:
+
+```json
+{"url":"https://cpamp.example.invalid","key":"REPLACE_WITH_CPAMP_ADMIN_KEY"}
+```
+
+Use the CPAMP admin key, not the CPA Management Key. Only an HTTPS origin or
+numeric-loopback HTTP is accepted, without paths, user info, queries or fragments.
+The CPA container must reach this origin. Missing configuration, authentication
+failure or an unpatched CPAMP leaves recovery pending; CPA is never toggled directly.
+
+Only current, identity-matched CPAMP-owned Codex 429 cooldowns are eligible.
+Read-only proof must show a new exhausted window; a successful normal request can
+also prove same-window recovery. Manual account mutations through CPAMP revoke
+ownership, including failed/unknown mutations. Direct CPA changes bypass that
+protection; do not concurrently manage the same toggle through another manager.
+
+Recovery is persisted before local release. After an unknown submission, the
+original cooldown is checked before retry; stale evidence is re-read without
+another activation request. Retry delay is one minute for the first three retries,
+then fifteen minutes. `quota.reenabled` means CPAMP confirmed enablement;
+`quota.recovery_pending` does not. Schema 1 gains optional `quota_recoveries`;
+older plugins discard that field, so preserve a state backup before rollback.
+
 ### Reset-window activation
 
 OpenAI may report that a quota reset time has passed without creating the next

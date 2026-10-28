@@ -15,8 +15,10 @@ type probeReadPayload struct {
 	Windows []ProbeWindowKind
 }
 type probeReadResult struct {
-	Quota       ParsedQuota
-	Credentials CodexCredentials
+	Quota                 ParsedQuota
+	Credentials           CodexCredentials
+	StartedAt, ObservedAt time.Time
+	Verified              bool
 }
 type probeSequencePayload struct {
 	Binding RuntimeBinding
@@ -1461,11 +1463,12 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			if credentials.ChatGPTAccountID == "" {
 				return probeReadResult{}, ErrAccountIdentityUnresolved
 			}
-			if r.runtimeRoster().Provisional && NewCredentialFingerprint(credentials.ChatGPTAccountID, credentials.RefreshToken, p.Binding.AuthIndex) != p.Binding.Fingerprint {
+			if NewCredentialFingerprint(credentials.ChatGPTAccountID, credentials.RefreshToken, p.Binding.AuthIndex) != p.Binding.Fingerprint {
 				return probeReadResult{}, ErrProvisionalFingerprintMismatch
 			}
+			started := r.now()
 			quota, err := r.typedFetchQuota(ctx, held, credentials)
-			return probeReadResult{Quota: quota, Credentials: credentials}, err
+			return probeReadResult{Quota: quota, Credentials: credentials, StartedAt: started, ObservedAt: r.now()}, err
 		}
 		recordFailure := func(err error, sent bool, windows []ProbeWindowKind) {
 			failureFields := eventFields(windows, sent)
@@ -1557,6 +1560,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			verifiedFields["verified_at"] = formatTime(r.now())
 			recordLog("info", "probe.verified", "额度周期激活验证完成", verifiedFields)
 			res.ReadStartSeq = seq
+			vr.Verified = true
 			res.Value = vr
 			return res
 		}
@@ -1622,6 +1626,8 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 				recordFailure(err, false, p.Windows)
 				return OperationResult{Token: intent.Token, Err: err}
 			}
+			pre.Verified = true
+			res.Value = pre
 			return res
 		}
 		r.probeHoldMu.Unlock()
@@ -1705,6 +1711,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 		verifiedFields["verified_at"] = formatTime(r.now())
 		recordLog("info", "probe.verified", "额度周期激活验证完成", verifiedFields)
 		res.ReadStartSeq = seq
+		vr.Verified = true
 		res.Value = vr
 		return res
 	case OperationQuotaRead, OperationProbePrecheck, OperationProbeVerify:
@@ -1724,6 +1731,14 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			res.Err = ErrAccountIdentityUnresolved
 			return res
 		}
+		if r.bindings != nil {
+			b, ok := r.bindings.Lookup(intent.AuthID)
+			if !ok || NewCredentialFingerprint(credentials.ChatGPTAccountID, credentials.RefreshToken, b.AuthIndex) != intent.Fingerprint {
+				res.Err = ErrStaleExecutionToken
+				return res
+			}
+		}
+		started := r.now()
 		quota, err := r.typedFetchQuota(ctx, held, credentials)
 		if err != nil {
 			if status, ok := err.(quotaStatusError); ok && status.status == http.StatusUnauthorized && r.bindings != nil {
@@ -1732,7 +1747,7 @@ func (r *QuotaRefresher) runTypedHeld(ctx context.Context, intent Intent, held *
 			res.Err = err
 			return res
 		}
-		res.Value = probeReadResult{Quota: quota, Credentials: credentials}
+		res.Value = probeReadResult{Quota: quota, Credentials: credentials, StartedAt: started, ObservedAt: r.now(), Verified: true}
 	}
 	return res
 }

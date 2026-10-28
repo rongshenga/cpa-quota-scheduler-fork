@@ -87,9 +87,9 @@ func HandleUsageFeedback(state *PluginState, record pluginapi.UsageRecord, now t
 		return
 	}
 	if event.AuthID != "" {
-		state.MarkAccountTemporaryExhausted(event.AuthID, event.ResetAt, event.Reason)
+		state.MarkAccountTemporaryExhausted(event.AuthID, event.ResetAt, event.Reason, now)
 	} else {
-		state.MarkAccountTemporaryExhaustedByAuthIndex(event.AuthIndex, event.ResetAt, event.Reason)
+		state.MarkAccountTemporaryExhaustedByAuthIndex(event.AuthIndex, event.ResetAt, event.Reason, now)
 	}
 	state.RecordLog("warn", "quota.temporary_exhausted", "账号额度已用尽，等待重置", map[string]any{
 		"auth_id":    event.AuthID,

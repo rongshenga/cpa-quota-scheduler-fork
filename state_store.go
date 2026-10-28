@@ -15,6 +15,7 @@ const CurrentStateSchema = 1
 var ErrStateReadOnly = errors.New("state store is read-only")
 
 type PersistentState struct {
+	QuotaRecoveries     map[string]quotaRecovery                           `json:"quota_recoveries,omitempty"`
 	SchemaVersion       int                                                `json:"schema_version"`
 	ReservedCeiling     uint64                                             `json:"reserved_ceiling"`
 	NextSaveSeq         uint64                                             `json:"next_save_seq"`

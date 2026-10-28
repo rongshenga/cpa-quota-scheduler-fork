@@ -53,6 +53,9 @@ func ParseCodexUsagePayload(raw []byte, now time.Time) (ParsedQuota, error) {
 	if !ok {
 		return parsed, nil
 	}
+	allowed, hasAllowed := getBool(rateLimit, "allowed")
+	reached, _ := getBool(rateLimit, "limit_reached", "limitReached")
+	parsed.UsageLimitReached = (hasAllowed && !allowed) || reached
 	for _, window := range parseRateLimitWindows(rateLimit, now) {
 		window := window
 		switch window.Kind {
