@@ -129,6 +129,8 @@ Probe 的只读观察发现（现行最短 30 分钟），不能保证立即发�
 
 CPAMP 1.13.1 原版没有本分支需要的提前恢复接口，须配套安装
 `/usage-service/quota-cooldowns/recover-verified` 补丁；只升级插件不会自动启用。
+配套补丁见 [`compat/cpamp-v1.13.1-quota-recovery.patch`](compat/cpamp-v1.13.1-quota-recovery.patch)，
+基于 CPAMP `e188cd8ac4a9ef7a9875d37480a301f29997905d`，不直接套用到其他版本。
 在插件持久化目录（`.runtime-state.json` 同目录）配置 `cpamp-recovery.json`，
 只允许普通文件，权限 `0600`，不允许符号链接。示例均为占位内容：
 
@@ -139,7 +141,7 @@ CPAMP 1.13.1 原版没有本分支需要的提前恢复接口，须配套安装
 `url` 是 CPAMP 根地址，仅允许 HTTPS，或数字回环地址的 HTTP；不能含路径、
 查询参数、用户信息。`key` 为 CPAMP 管理员密钥，不是 CPA Management Key；
 只保存在部署机器的私有文件中，不写日志、仓库或面板配置。部署时需确保 CPA
-容器能够访问该地址。未配置/鉴权失败/旧 CPAMP 均保持待恢复，不直接修改 CPA。
+容器能够访问该地址。新增或修正配置后需重载插件以接续待办。未配置/鉴权失败/旧 CPAMP 均保持待恢复，不直接修改 CPA。
 
 恢复只针对当前最高优先级层中身份和凭据版本一致、由 CPAMP 的 Codex 额度
 429 创建且仍有效的冷却记录。证据需新鲜、发生在停用之后；纯额度读取必须

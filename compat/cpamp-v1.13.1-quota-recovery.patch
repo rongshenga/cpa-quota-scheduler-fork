@@ -1,0 +1,405 @@
+From b3fd01fb10bd33e88d1a535a34478950b5350cc4 Mon Sep 17 00:00:00 2001
+From: murongsheng <murongsheng@pinduoduo.com>
+Date: Wed, 28 Oct 2026 18:20:57 +0800
+Subject: [PATCH] =?UTF-8?q?fix:=20=E4=BE=9D=E6=8D=AE=E6=96=B0=E9=B2=9C?=
+ =?UTF-8?q?=E9=A2=9D=E5=BA=A6=E8=AF=81=E6=8D=AE=E6=81=A2=E5=A4=8D=E8=87=AA?=
+ =?UTF-8?q?=E6=9C=89=E5=86=B7=E5=8D=B4=E5=B9=B6=E5=B0=8A=E9=87=8D=E4=BA=BA?=
+ =?UTF-8?q?=E5=B7=A5=E5=81=9C=E7=94=A8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[skip ci]
+---
+ README_CN.md                                  | 18 ++++
+ .../cmd/cpa-manager-plus/main.go              |  1 +
+ apps/manager-server/internal/app/context.go   | 14 ++-
+ .../http/controller/quotacooldown/handler.go  | 35 +++++++
+ .../internal/http/router/router.go            |  1 +
+ .../internal/model/quota_recovery.go          | 92 +++++++++++++++++++
+ .../internal/service/proxy/service.go         | 19 ++++
+ .../worker/rate_limit_auto_disable.go         | 74 ++++++++++++++-
+ 8 files changed, 248 insertions(+), 6 deletions(-)
+ create mode 100644 apps/manager-server/internal/model/quota_recovery.go
+
+diff --git a/README_CN.md b/README_CN.md
+index 7a1f1a6..267dd62 100644
+--- a/README_CN.md
++++ b/README_CN.md
+@@ -264,3 +264,21 @@ docker compose -f docker-compose.manager.yml up --build
+ ## 许可证
+ 
+ [MIT](https://github.com/seakee/CPA-Manager-Plus/blob/main/LICENSE) — Copyright 2026 Seakee。
++
++### 本地额度恢复补丁
++
++本分支基于 v1.13.1，增加供 `codex-quota-scheduler` 使用的认证接口
++`POST /usage-service/quota-cooldowns/recover-verified`，不升级面板或改变默认
++定时恢复策略。GET 冷却记录新增 `updatedAtMs`，POST 必须提交同一记录的
++停用时间、恢复时间、修订时间、账号文件名、auth index、provider 和新鲜
++额度证据。仅接受 CPAMP 管理员认证，拒绝浏览器 Origin、查询参数和未知字段。
++
++接口只处理 CPAMP 自己因 Codex 额度 429 创建的有效冷却。只读额度证据要求
++耗尽窗口的重置时间已变化；正常成功请求可以证明同周期恢复。长窗口与所有
++返回窗口均需有效且未耗尽，五小时耗尽记录不能凭缺失五小时窗口恢复。
++复用账号互斥、身份校验和失败回滚，取得锁后及写入前重新核对证据时效。
++
++在 CPAMP 手动编辑、启停、替换或删除账号会撤销对应冷却所有权；即使该手动
++操作失败或结果未知，也不会自动重新认领。直接调用 CPA 修改开关无法识别
++为 CPAMP 人工操作，部署时应避免多个管理器并行控制同一开关。日志及接口
++成功仅表示此次核对完成，不保证之后不会因新的 429 再次停用。
+diff --git a/apps/manager-server/cmd/cpa-manager-plus/main.go b/apps/manager-server/cmd/cpa-manager-plus/main.go
+index 0fcfbe4..5a55278 100644
+--- a/apps/manager-server/cmd/cpa-manager-plus/main.go
++++ b/apps/manager-server/cmd/cpa-manager-plus/main.go
+@@ -189,6 +189,7 @@ func runServer() {
+ 			ManagementKey:  cfg.ManagementKey,
+ 		},
+ 	)
++	serverApp.AppContext().QuotaRecoveryService = rateLimitAutoDisableWorker
+ 	accountActionWorker := worker.NewAccountActionCandidateWorkerWithMutationCoordinator(
+ 		db,
+ 		serverApp.AppContext().AuthFileMutationCoordinator,
+diff --git a/apps/manager-server/internal/app/context.go b/apps/manager-server/internal/app/context.go
+index e5dffd5..48bf2c7 100644
+--- a/apps/manager-server/internal/app/context.go
++++ b/apps/manager-server/internal/app/context.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo"
+ 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/collector"
+ 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/config"
++	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+ 	sqliterepo "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/sqlite"
+ 	accountactionsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/accountaction"
+ 	adminauthsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/adminauth"
+@@ -36,15 +37,20 @@ type AutomationRuntimeService interface {
+ 	Reload(ctx context.Context) error
+ }
+ 
++type QuotaRecoveryService interface {
++	RecoverVerifiedCooldown(context.Context, model.VerifiedQuotaRecovery) (bool, error)
++}
++
+ type DatabaseMaintenanceStatusProvider interface {
+ 	Snapshot() sqliterepo.WALMaintenanceSnapshot
+ }
+ 
+ type Context struct {
+-	UpdateCheckService *updatechecksvc.Service
+-	Config             config.Config
+-	Store              *store.Store
+-	Collector          *collector.Manager
++	QuotaRecoveryService QuotaRecoveryService
++	UpdateCheckService   *updatechecksvc.Service
++	Config               config.Config
++	Store                *store.Store
++	Collector            *collector.Manager
+ 
+ 	StartedAt int64
+ 	ServiceID string
+diff --git a/apps/manager-server/internal/http/controller/quotacooldown/handler.go b/apps/manager-server/internal/http/controller/quotacooldown/handler.go
+index 84f0bd0..d70afa7 100644
+--- a/apps/manager-server/internal/http/controller/quotacooldown/handler.go
++++ b/apps/manager-server/internal/http/controller/quotacooldown/handler.go
+@@ -2,6 +2,7 @@ package quotacooldown
+ 
+ import (
+ 	"encoding/json"
++	"io"
+ 	"net/http"
+ 	"strings"
+ 
+@@ -31,6 +32,7 @@ type cooldownItem struct {
+ 	Evidence        *usage.ProviderUsageMetadata `json:"evidence,omitempty"`
+ 	RecoverAtMs     int64                        `json:"recoverAtMs"`
+ 	DisabledAtMs    int64                        `json:"disabledAtMs"`
++	UpdatedAtMs     int64                        `json:"updatedAtMs"`
+ 	CreatedAtMs     int64                        `json:"createdAtMs"`
+ }
+ 
+@@ -86,6 +88,7 @@ func mapCooldown(c model.QuotaCooldown) cooldownItem {
+ 		RecoverAtMs:     c.RecoverAtMS,
+ 		DisabledAtMs:    c.DisabledAtMS,
+ 		CreatedAtMs:     c.CreatedAtMS,
++		UpdatedAtMs:     c.UpdatedAtMS,
+ 	}
+ }
+ 
+@@ -124,3 +127,35 @@ func parseCooldownEvidence(raw string, recoverAtMS int64) *usage.ProviderUsageMe
+ 	}
+ 	return evidence
+ }
++
++func (h *Handler) RecoverVerified(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		response.MethodNotAllowed(w)
++		return
++	}
++	// 此服务间入口拒绝浏览器来源，保留既有管理认证，不允许参数携带密钥。
++	if r.Header.Get("Origin") != "" || r.URL.RawQuery != "" {
++		http.Error(w, "recovery_request_invalid", http.StatusBadRequest)
++		return
++	}
++	if !middleware.AuthorizePanel(w, r, h.App.AdminAuthService) {
++		return
++	}
++	if h.App.QuotaRecoveryService == nil {
++		http.Error(w, "recovery_unavailable", http.StatusServiceUnavailable)
++		return
++	}
++	var request model.VerifiedQuotaRecovery
++	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
++	decoder.DisallowUnknownFields()
++	if decoder.Decode(&request) != nil || decoder.Decode(new(any)) != io.EOF {
++		http.Error(w, "recovery_request_invalid", http.StatusBadRequest)
++		return
++	}
++	recovered, err := h.App.QuotaRecoveryService.RecoverVerifiedCooldown(r.Context(), request)
++	if err != nil {
++		http.Error(w, "recovery_not_confirmed", http.StatusConflict)
++		return
++	}
++	response.JSON(w, http.StatusOK, map[string]bool{"recovered": recovered})
++}
+diff --git a/apps/manager-server/internal/http/router/router.go b/apps/manager-server/internal/http/router/router.go
+index 8bc815f..bb872a1 100644
+--- a/apps/manager-server/internal/http/router/router.go
++++ b/apps/manager-server/internal/http/router/router.go
+@@ -54,6 +54,7 @@ func New(appCtx *app.Context) http.Handler {
+ 	mux.HandleFunc("/usage-service/config", middleware.WithCORS(appCtx.Config, managerConfigHandler.Handle))
+ 	mux.HandleFunc("/usage-service/account-processing-policy", middleware.WithCORS(appCtx.Config, automationHandler.Handle))
+ 	mux.HandleFunc("/usage-service/quota-cooldowns", middleware.WithCORS(appCtx.Config, quotaCooldownHandler.Handle))
++	mux.HandleFunc("/usage-service/quota-cooldowns/recover-verified", quotaCooldownHandler.RecoverVerified)
+ 	mux.HandleFunc("/setup", middleware.WithCORS(appCtx.Config, setupHandler.Setup))
+ 	mux.HandleFunc("/management.html", panelHandler.ManagementHTML)
+ 	mux.HandleFunc("/", rootHandler(appCtx, usageHandler, modelPriceHandler, apiKeyAliasHandler, accountActionHandler, codexInspectionHandler, dashboardHandler, monitoringHandler, quotaSnapshotHandler, managerConfigHandler, proxyHandler))
+diff --git a/apps/manager-server/internal/model/quota_recovery.go b/apps/manager-server/internal/model/quota_recovery.go
+new file mode 100644
+index 0000000..b103f18
+--- /dev/null
++++ b/apps/manager-server/internal/model/quota_recovery.go
+@@ -0,0 +1,92 @@
++package model
++
++import (
++	"math"
++	"time"
++)
++
++type QuotaRecoveryWindow struct {
++	UsedPercent   *float64 `json:"usedPercent"`
++	WindowSeconds int64    `json:"windowSeconds"`
++	ResetAtMS     int64    `json:"resetAtMs"`
++}
++
++// 同一冷却修订与新鲜窗口共同限定提前恢复，防止旧证据解除后续新禁用。
++type VerifiedQuotaRecovery struct {
++	AuthFileName         string                `json:"authFileName"`
++	AuthIndex            string                `json:"authIndex"`
++	Provider             string                `json:"provider"`
++	ExpectedDisabledAtMS int64                 `json:"expectedDisabledAtMs"`
++	ExpectedRecoverAtMS  int64                 `json:"expectedRecoverAtMs"`
++	ExpectedUpdatedAtMS  int64                 `json:"expectedUpdatedAtMs"`
++	ObservedAtMS         int64                 `json:"observedAtMs"`
++	StartedAtMS          int64                 `json:"startedAtMs"`
++	Source               string                `json:"source"`
++	Windows              []QuotaRecoveryWindow `json:"windows"`
++}
++
++func (r VerifiedQuotaRecovery) Confirms(item QuotaCooldown, now time.Time) bool {
++	if r.AuthFileName == "" || r.AuthIndex == "" || r.Provider != "codex" || r.AuthFileName != item.AuthFileName || r.AuthIndex != item.AuthIndex || item.Provider != "codex" || item.Owner != QuotaCooldownOwnerUsage429 || item.PreDisabledState || item.Status != QuotaCooldownStatusActive || item.ReasonCode != "codex_usage_limit_reached" {
++		return false
++	}
++	if r.ExpectedRecoverAtMS <= 0 || r.ExpectedDisabledAtMS <= 0 || r.ExpectedUpdatedAtMS <= 0 || r.ExpectedDisabledAtMS != item.DisabledAtMS || r.ExpectedRecoverAtMS != item.RecoverAtMS || r.ExpectedUpdatedAtMS != item.UpdatedAtMS {
++		return false
++	}
++	if r.StartedAtMS <= item.DisabledAtMS || r.ObservedAtMS < r.StartedAtMS || r.ObservedAtMS > now.UnixMilli()+5000 || now.UnixMilli()-r.ObservedAtMS > 120000 || r.Source != "probe" && r.Source != "response" {
++		return false
++	}
++	if len(r.Windows) < 1 || len(r.Windows) > 2 {
++		return false
++	}
++	long, primary, changed := false, false, false
++	allChanged := true
++	for _, w := range r.Windows {
++		if w.UsedPercent == nil || math.IsNaN(*w.UsedPercent) || math.IsInf(*w.UsedPercent, 0) || *w.UsedPercent < 0 || *w.UsedPercent >= 100 || w.ResetAtMS <= now.UnixMilli() {
++			return false
++		}
++		kind := ""
++		switch {
++		case w.WindowSeconds >= 299*60 && w.WindowSeconds <= 301*60:
++			if primary {
++				return false
++			}
++			primary = true
++			kind = "five_hour"
++		case w.WindowSeconds >= 10079*60 && w.WindowSeconds <= 10081*60:
++			if long {
++				return false
++			}
++			long = true
++			kind = "weekly"
++		case w.WindowSeconds >= 40319*60 && w.WindowSeconds <= 44641*60:
++			if long {
++				return false
++			}
++			long = true
++			kind = "monthly"
++		default:
++			return false
++		}
++		if w.ResetAtMS > now.UnixMilli()+w.WindowSeconds*1000+180000 {
++			return false
++		}
++		if absMillis(w.ResetAtMS-item.RecoverAtMS) <= 60000 {
++			allChanged = false
++		}
++		if kind == item.WindowKind && absMillis(w.ResetAtMS-item.RecoverAtMS) > 60000 {
++			changed = true
++		}
++	}
++	// 正常成功响应可证明同周期已可用；纯额度读取必须有被耗尽窗口的身份变化。
++	if item.WindowKind == "unknown" {
++		return long && primary && (r.Source == "response" || allChanged)
++	}
++	return long && (item.WindowKind != "five_hour" || primary) && (item.WindowKind == "five_hour" || item.WindowKind == "weekly" || item.WindowKind == "monthly") && (r.Source == "response" || changed)
++}
++
++func absMillis(value int64) int64 {
++	if value < 0 {
++		return -value
++	}
++	return value
++}
+diff --git a/apps/manager-server/internal/service/proxy/service.go b/apps/manager-server/internal/service/proxy/service.go
+index a6de78c..1842e27 100644
+--- a/apps/manager-server/internal/service/proxy/service.go
++++ b/apps/manager-server/internal/service/proxy/service.go
+@@ -376,6 +376,25 @@ func (s *Service) revokeInspectionOwnership(ctx context.Context, mutation authFi
+ 	if s.store == nil || (!mutation.clearAll && len(mutation.fileNames) == 0 && len(mutation.ownershipTargets) == 0) {
+ 		return nil, nil
+ 	}
++	// 用户显式修改账号后撤销额度恢复所有权；未知写结果也不能重新接管。
++	active, err := s.store.QuotaCooldowns.ListActive(ctx)
++	if err != nil {
++		return nil, err
++	}
++	for _, item := range active {
++		matches := mutation.clearAll
++		for _, name := range mutation.fileNames {
++			matches = matches || name == item.AuthFileName
++		}
++		for _, target := range mutation.ownershipTargets {
++			matches = matches || (target.FileName == item.AuthFileName && (target.AuthIndex == nil || *target.AuthIndex == item.AuthIndex))
++		}
++		if matches {
++			if err := s.store.MarkQuotaCooldownSkipped(ctx, item.ID, "manual auth mutation"); err != nil {
++				return nil, err
++			}
++		}
++	}
+ 	targets := make([]model.CodexInspectionDisableOwnershipTarget, 0, len(mutation.fileNames)+len(mutation.ownershipTargets))
+ 	for _, fileName := range mutation.fileNames {
+ 		targets = append(targets, model.CodexInspectionDisableOwnershipTarget{FileName: fileName})
+diff --git a/apps/manager-server/internal/worker/rate_limit_auto_disable.go b/apps/manager-server/internal/worker/rate_limit_auto_disable.go
+index 1fe624c..79eeadb 100644
+--- a/apps/manager-server/internal/worker/rate_limit_auto_disable.go
++++ b/apps/manager-server/internal/worker/rate_limit_auto_disable.go
+@@ -608,7 +608,56 @@ func (w *RateLimitAutoDisableWorker) enableDueLocked(ctx context.Context, now ti
+ 	}
+ }
+ 
+-func (w *RateLimitAutoDisableWorker) recoverCooldown(ctx context.Context, baseURL string, managementKey string, item store.QuotaCooldown, now time.Time) {
++// 只接收具名账号的新鲜恢复证据；写入仍沿原身份核对、互斥及回滚事务。
++func (w *RateLimitAutoDisableWorker) RecoverVerifiedCooldown(ctx context.Context, request model.VerifiedQuotaRecovery) (bool, error) {
++	w.operationMu.Lock()
++	defer w.operationMu.Unlock()
++	if w.store == nil || w.store.QuotaCooldowns == nil {
++		return false, errors.New("recovery_store_unavailable")
++	}
++	base, key := w.runtimeConfig()
++	if base == "" || key == "" {
++		return false, errors.New("recovery_upstream_unavailable")
++	}
++	active, err := w.store.QuotaCooldowns.ListActive(ctx)
++	if err != nil {
++		return false, err
++	}
++	var target *store.QuotaCooldown
++	for i := range active {
++		item := &active[i]
++		if item.AuthFileName == request.AuthFileName && item.AuthIndex == request.AuthIndex && item.Provider == request.Provider {
++			if target != nil {
++				return false, errors.New("recovery_identity_ambiguous")
++			}
++			target = item
++		}
++	}
++	if target == nil {
++		return false, nil
++	}
++	if !request.Confirms(*target, time.Now()) {
++		return false, errors.New("recovery_evidence_invalid")
++	}
++	w.recoverCooldown(ctx, base, key, *target, time.Now(), &request)
++	active, err = w.store.QuotaCooldowns.ListActive(ctx)
++	if err != nil {
++		return false, err
++	}
++	for _, item := range active {
++		if item.ID == target.ID {
++			return false, errors.New("recovery_pending")
++		}
++	}
++	current, ok, err := w.currentAuthFileTarget(ctx, base, key, cpaauthfiles.Identity{AuthFileName: target.AuthFileName, AuthIndex: target.AuthIndex, Provider: target.Provider, AccountSnapshot: target.AccountSnapshot})
++	if err != nil || !ok || current.File.Disabled {
++		return false, errors.New("recovery_not_enabled")
++	}
++	log.Printf("[quota-auto-disable] verified early recovery completed id=%d", target.ID)
++	return true, nil
++}
++
++func (w *RateLimitAutoDisableWorker) recoverCooldown(ctx context.Context, baseURL string, managementKey string, item store.QuotaCooldown, now time.Time, proof ...*model.VerifiedQuotaRecovery) {
+ 	if item.Owner != model.QuotaCooldownOwnerUsage429 && item.Owner != model.QuotaCooldownOwnerXAIFreeUsage {
+ 		reason := "unknown owner"
+ 		_ = w.store.MarkQuotaCooldownSkipped(ctx, item.ID, reason)
+@@ -670,6 +719,24 @@ func (w *RateLimitAutoDisableWorker) recoverCooldown(ctx context.Context, baseUR
+ 		return
+ 	}
+ 	defer releaseMutation()
++	// 人工修改可能在取得账号锁之前撤销所有权，锁内重读后才可恢复。
++	active, readErr := w.store.QuotaCooldowns.ListActive(ctx)
++	if readErr != nil {
++		return
++	}
++	owned := false
++	for _, current := range active {
++		if current.ID == item.ID && current.UpdatedAtMS == item.UpdatedAtMS && current.Status == model.QuotaCooldownStatusActive {
++			owned = true
++			break
++		}
++	}
++	if !owned {
++		return
++	}
++	if len(proof) > 0 && (proof[0] == nil || !proof[0].Confirms(item, time.Now())) {
++		return
++	}
+ 	target, ok, err := w.currentAuthFileTarget(ctx, baseURL, managementKey, cpaauthfiles.Identity{
+ 		AuthFileName:      item.AuthFileName,
+ 		AuthIndex:         authIndex,
+@@ -703,7 +770,10 @@ func (w *RateLimitAutoDisableWorker) recoverCooldown(ctx context.Context, baseUR
+ 		return
+ 	}
+ 
+-	log.Printf("[quota-auto-disable] reset time reached for auth file %q account=%q, enabling", item.AuthFileName, item.AccountSnapshot)
++	if len(proof) > 0 && !proof[0].Confirms(item, time.Now()) {
++		return
++	}
++	log.Printf("[quota-auto-disable] quota recovery confirmed for auth file %q account=%q, enabling", item.AuthFileName, item.AccountSnapshot)
+ 	if err := w.patchAuthFileTarget(ctx, baseURL, managementKey, target, false); err != nil {
+ 		_ = w.store.RecordQuotaCooldownFailure(ctx, item.ID, err.Error())
+ 		log.Printf("[quota-auto-disable] failed to enable auth file %q: %v", item.AuthFileName, err)
+-- 
+2.54.0 (Apple Git-157)
+

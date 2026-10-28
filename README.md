@@ -149,7 +149,8 @@ schedule, `gpt-6-luna`, and unknown-send safeguards remain. Disabled accounts ha
 no normal traffic; unknown early resets still need the existing read-only Probe
 observation (minimum 30 minutes).
 
-CPAMP v1.13.1 needs the companion `recover-verified` endpoint patch. Set a private,
+CPAMP v1.13.1 needs the [companion endpoint patch](compat/cpamp-v1.13.1-quota-recovery.patch),
+based on `e188cd8ac4a9ef7a9875d37480a301f29997905d`; do not apply it to other versions. Set a private,
 non-symlink, mode-0600 `cpamp-recovery.json` beside `.runtime-state.json`:
 
 ```json
@@ -158,7 +159,7 @@ non-symlink, mode-0600 `cpamp-recovery.json` beside `.runtime-state.json`:
 
 Use the CPAMP admin key, not the CPA Management Key. Only an HTTPS origin or
 numeric-loopback HTTP is accepted, without paths, user info, queries or fragments.
-The CPA container must reach this origin. Missing configuration, authentication
+The CPA container must reach this origin. Reload the plugin after adding or fixing this file. Missing configuration, authentication
 failure or an unpatched CPAMP leaves recovery pending; CPA is never toggled directly.
 
 Only current, identity-matched CPAMP-owned Codex 429 cooldowns are eligible.
